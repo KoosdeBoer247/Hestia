@@ -1,0 +1,693 @@
+"""
+Created on Sat Nov 15 16:47:21 2025
+
+@author: deboe
+"""
+
+# HERA (Heat Exposure Risk Assessment)
+# Complete version with latitude-based climate adaptation adjustment
+# Based on scientific research: Gasparrini et al. (2015), Périard et al. (2015)
+# 
+# This script calculates WBGT (Wet Bulb Globe Temperature) with multiple correction options:
+# 1. Base WBGT (no corrections)
+# 2. WBGT with Urban Heat Island (UHI) effect
+# 3. WBGT with latitude-based climate adaptation adjustment
+#
+# Author: Updated with latitude adjustment
+# Date: 2025-11-15
+
+from datetime import datetime, UTC, timedelta
+import requests
+import pandas as pd
+import numpy as np
+import pytz
+from timezonefinder import TimezoneFinder
+import pvlib
+import math
+from pythermalcomfort.models import wbgt
+from pythermalcomfort.utilities import wet_bulb_tmp
+import os
+
+try:
+    from openpyxl import load_workbook
+except ImportError:
+    print("Warning: 'openpyxl' is not installed. Excel export will not work.")
+    print("Install it with: pip install openpyxl")
+
+print("HERA: Heat Exposure Risk Assessment - Starting")
+
+
+def calculate_latitude_adjustment(latitude: float, baseline_lat: float = 40.0) -> float:
+    """
+    Calculate latitude-based adjustment for heat vulnerability based on 
+    chronic climate adaptation.
+    
+    Scientific Basis:
+    -----------------
+    Populations living in warmer climates (lower latitudes) develop long-term
+    physiological adaptations to heat stress (Périard et al., 2015; Taylor, 2014):
+    - Enhanced sudomotor function (earlier sweating onset, higher sweat rate)
+    - Improved cardiovascular stability during heat stress
+    - Behavioral and cultural heat avoidance strategies
+    
+    Epidemiological evidence (Gasparrini et al., 2015; Bobb et al., 2014) shows
+    heat mortality thresholds vary by 5-7°C between northern and southern regions,
+    supporting a ~0.02°C WBGT adjustment per degree latitude.
+    
+    Parameters:
+    -----------
+    latitude : float
+        Latitude of the location in degrees
+        - Positive values: Northern Hemisphere (e.g., +52.0 for Amsterdam)
+        - Negative values: Southern Hemisphere (e.g., -34.0 for Sydney)
+        - Function uses absolute value, so both hemispheres are treated equally
+    baseline_lat : float, optional
+        Reference latitude for temperate zones (default: 40°)
+        This represents mid-latitude regions with moderate climate
+        Works symmetrically: 40°N (Rome) ≈ 40°S (Wellington, NZ)
+    
+    Returns:
+    --------
+    float : 
+        WBGT adjustment in °C
+        - Negative values: increased vulnerability (colder climates)
+        - Positive values: increased tolerance (warmer climates)
+    
+    Examples:
+    ---------
+    # Northern Hemisphere
+    >>> calculate_latitude_adjustment(52.0)  # Amsterdam
+    -0.24  # More vulnerable (cold climate adaptation)
+    
+    >>> calculate_latitude_adjustment(41.0)  # Barcelona
+    -0.02  # Near baseline (temperate)
+    
+    >>> calculate_latitude_adjustment(26.0)  # Miami
+    +0.28  # More tolerant (warm climate adaptation)
+    
+    # Southern Hemisphere (note: use negative values)
+    >>> calculate_latitude_adjustment(-34.0)  # Sydney
+    +0.12  # More tolerant (warm climate, same as 34°N)
+    
+    >>> calculate_latitude_adjustment(-38.0)  # Melbourne
+    +0.04  # Near baseline (temperate, same as 38°N)
+    
+    >>> calculate_latitude_adjustment(-52.0)  # Tierra del Fuego
+    -0.24  # More vulnerable (cold climate, same as 52°N)
+    
+    # Equatorial regions
+    >>> calculate_latitude_adjustment(1.0)   # Singapore
+    +0.78  # Highly tolerant (equatorial)
+    
+    >>> calculate_latitude_adjustment(-1.0)  # Quito, Ecuador
+    +0.78  # Highly tolerant (equatorial, same as +1°)
+    
+    References:
+    -----------
+    - Gasparrini, A., et al. (2015). Mortality risk attributable to high and 
+      low ambient temperature. The Lancet, 386(9991), 369-375.
+    - Périard, J.D., et al. (2015). Adaptations and mechanisms of human heat 
+      acclimation. Scand J Med Sci Sports, 25(S1), 20-38.
+    - Bobb, J.F., et al. (2014). Heat-related mortality and adaptation to heat. 
+      Environ Health Perspect, 122(8), 811-816.
+    - Taylor, N.A. (2014). Human heat adaptation. Compr Physiol, 4(1), 325-365.
+    """
+    # Calculate difference from baseline (negative = further north, positive = further south)
+    lat_diff = abs(baseline_lat) - abs(latitude)
+    
+    # Apply 0.02°C per degree latitude adjustment
+    # Based on ~0.2°C per 10° latitude from epidemiological studies
+    adjustment = 0.02 * lat_diff
+    
+    # Cap adjustment to reasonable bounds (-2°C to +2°C)
+    # Prevents extreme values at polar/equatorial regions
+    adjustment = max(-2.0, min(2.0, adjustment))
+    
+    return round(adjustment, 2)
+
+
+def get_lat_lon(city_name):
+    """
+    Retrieves latitude and longitude for a given city using the
+    Open-Meteo Geocoding API.
+    """
+    try:
+        geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={city_name}&count=1&format=json"
+        response = requests.get(geo_url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if data and "results" in data and len(data["results"]) > 0:
+            return data["results"][0]["latitude"], data["results"][0]["longitude"]
+        else:
+            return None, None
+    except requests.RequestException as e:
+        print(f"Error fetching location: {e}")
+        return None, None
+
+
+def get_timezone(lat, lon):
+    """
+    Determines the IANA timezone name for a given latitude and longitude.
+    """
+    tf = TimezoneFinder()
+    timezone_name = tf.timezone_at(lat=lat, lng=lon)
+    return pytz.timezone(timezone_name) if timezone_name else pytz.UTC
+
+
+def get_weather_forecast(lat, lon):
+    """
+    Retrieves a 7-day hourly weather forecast from the Open-Meteo API.
+    """
+    try:
+        forecast_url = (
+            f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+            "&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m,cloud_cover,surface_pressure"
+            "&forecast_days=7&timezone=UTC"
+        )
+        response = requests.get(forecast_url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        if not data or "hourly" not in data:
+            print("No hourly data returned from Open-Meteo.")
+            return None
+
+        hourly = data["hourly"]
+        
+        owm_like_list = []
+        for i in range(len(hourly["time"])):
+            dt_str = hourly["time"][i]
+            dt_obj = pd.to_datetime(dt_str)
+            # ensure timestamps are UTC-aware
+            if getattr(dt_obj, 'tzinfo', None) is None:
+                dt_obj = dt_obj.tz_localize('UTC')
+            else:
+                dt_obj = dt_obj.tz_convert('UTC')
+            dt_timestamp = int(dt_obj.timestamp())
+            
+            wind_speed_ms = hourly["wind_speed_10m"][i] / 3.6
+            
+            entry = {
+                "dt": dt_timestamp,
+                "main": {
+                    "temp": hourly["temperature_2m"][i],
+                    "humidity": hourly["relative_humidity_2m"][i],
+                    "pressure": hourly["surface_pressure"][i]
+                },
+                "wind": {
+                    "speed": wind_speed_ms
+                },
+                "clouds": {
+                    "all": hourly["cloud_cover"][i]
+                }
+            }
+            owm_like_list.append(entry)
+            
+        return owm_like_list
+
+    except requests.RequestException as e:
+        print(f"Error fetching weather data: {e}")
+        return None
+
+
+def _map_us_aqi_to_owm_scale(us_aqi):
+    """Maps US AQI (0-500) to simple 1-5 scale."""
+    if us_aqi <= 50:  return 1
+    if us_aqi <= 100: return 2
+    if us_aqi <= 150: return 3
+    if us_aqi <= 200: return 4
+    return 5
+
+
+def get_air_quality(lat, lon):
+    """
+    Retrieves the current Air Quality Index (AQI) using Open-Meteo.
+    """
+    try:
+        air_url = f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat}&longitude={lon}&current=us_aqi&timezone=UTC"
+        response = requests.get(air_url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        us_aqi = data["current"]["us_aqi"]
+        return _map_us_aqi_to_owm_scale(us_aqi)
+        
+    except requests.RequestException as e:
+        print(f"Error fetching air quality: {e}")
+        return 1
+
+
+def calculate_solar_radiance(lat, lon, local_datetime_str, cloud_cover, aqi):
+    """
+    Calculates solar radiation components (GHI, DNI, DHI) and solar position using pvlib.
+    """
+    try:
+        local_timezone = get_timezone(lat, lon)
+        if local_timezone is None:
+            local_timezone = pytz.UTC
+        # Parse input datetime string or timezone-aware timestamp robustly
+        local_dt = pd.to_datetime(local_datetime_str)
+        # If parsed datetime is naive, assume it's UTC (Open-Meteo returns UTC timestamps)
+        if getattr(local_dt, 'tzinfo', None) is None:
+            local_dt = local_dt.tz_localize('UTC')
+        else:
+            # normalize to UTC before converting
+            local_dt = local_dt.tz_convert('UTC')
+        # convert to the location's timezone for solar position
+        local_datetime = local_dt.tz_convert(local_timezone.zone)
+        location = pvlib.location.Location(lat, lon, tz=local_timezone.zone, altitude=0)
+
+        solar_position = location.get_solarposition(pd.DatetimeIndex([local_datetime]))
+
+        elevation = solar_position['elevation'].iloc[0]
+        zenith = solar_position['apparent_zenith'].iloc[0]
+        azimuth = solar_position['azimuth'].iloc[0]
+
+        linke_turbidity = 2.5 if aqi <= 2 else 4.0 if aqi <= 4 else 6.0
+        clear_sky = location.get_clearsky(local_datetime, model='ineichen', linke_turbidity=linke_turbidity)
+
+        cloud_factor = 1 - (cloud_cover / 100)
+        cloud_factor = max(0.1, cloud_factor)
+
+        dni = clear_sky['dni'].iloc[0] * cloud_factor
+        dhi = clear_sky['dhi'].iloc[0] * (1 + (1 - cloud_factor) * 0.5)
+
+        ghi = dni * pvlib.irradiance.aoi_projection(0, 0, zenith, azimuth) + dhi
+
+        return {'ghi': max(0, ghi), 'dni': max(0, dni), 'dhi': max(0, dhi),
+                'solar_elevation': elevation, 'zenith': zenith}
+    except Exception as e:
+        if "year is out of range" in str(e):
+             return {'ghi': 0, 'dni': 0, 'dhi': 0, 'solar_elevation': 0, 'zenith': 90}
+        print(f"Error calculating solar radiance for {local_datetime_str}: {e}")
+        return {'ghi': 0, 'dni': 0, 'dhi': 0, 'solar_elevation': 0, 'zenith': 90}
+
+
+def wind_speed_at_height(v_ref, z_ref, z_target, z0=0.1):
+    """
+    Converts wind speed from a reference height to a target height.
+    """
+    if z_ref <= 0 or z_target <= 0 or z0 <= 0:
+        raise ValueError("Heights and roughness length must be positive.")
+    return v_ref * (np.log(z_target / z0) / np.log(z_ref / z0))
+
+
+def calculate_globe_temperature(dry_bulb_temp, ghi, wind_speed, solar_elevation, pressure, cloud_cover, aqi):
+    """
+    Calculates black globe temperature (150mm) based on full energy balance.
+    """
+    GLOBE_DIAMETER = 0.15
+    GLOBE_EMISSIVITY = 0.95
+    SOLAR_ABSORPTIVITY = 0.95
+    STEFAN_BOLTZMANN = 5.67e-8
+    
+    t_air_k = dry_bulb_temp + 273.15
+    
+    effective_wind = max(0.1, wind_speed)
+    h_c = 6.3 * (effective_wind**0.6) / (GLOBE_DIAMETER**0.4)
+    
+    if ghi <= 0 or solar_elevation <= 0:
+        sky_depression = 10 - (cloud_cover / 100) * 6
+        if aqi > 3:
+            sky_depression -= 2
+        sky_temp_k = t_air_k - sky_depression
+        net_radiation = GLOBE_EMISSIVITY * STEFAN_BOLTZMANN * (sky_temp_k**4 - t_air_k**4)
+        delta_t = net_radiation / h_c
+        t_globe_c = dry_bulb_temp + delta_t
+        return max(dry_bulb_temp - 3, min(dry_bulb_temp + 1, t_globe_c))
+    
+    solar_input_per_area = SOLAR_ABSORPTIVITY * ghi / 4.0
+    ambient_radiation = GLOBE_EMISSIVITY * STEFAN_BOLTZMANN * (t_air_k**4)
+    total_energy_in = solar_input_per_area + ambient_radiation
+    
+    h_r_initial = 4 * GLOBE_EMISSIVITY * STEFAN_BOLTZMANN * (t_air_k**3)
+    delta_t_initial = solar_input_per_area / (h_c + h_r_initial)
+    t_globe_k = t_air_k + delta_t_initial
+    
+    for _ in range(20):
+        radiation_out = GLOBE_EMISSIVITY * STEFAN_BOLTZMANN * (t_globe_k**4)
+        convection_out = h_c * (t_globe_k - t_air_k)
+        total_energy_out = radiation_out + convection_out
+        
+        imbalance = total_energy_in - total_energy_out
+        
+        if abs(imbalance) < 0.1:
+            break
+        
+        derivative = 4 * GLOBE_EMISSIVITY * STEFAN_BOLTZMANN * (t_globe_k**3) + h_c
+        correction = imbalance / derivative
+        damping_factor = 0.7
+        t_globe_k = t_globe_k + damping_factor * correction
+        
+        if t_globe_k < t_air_k - 5:
+            t_globe_k = t_air_k
+        elif t_globe_k > t_air_k + 50:
+            t_globe_k = t_air_k + 20
+    
+    t_globe_c = t_globe_k - 273.15
+    
+    if t_globe_c < dry_bulb_temp:
+        t_globe_c = dry_bulb_temp
+    
+    max_realistic_delta = 15 if effective_wind > 2.0 else 20
+    
+    if t_globe_c > dry_bulb_temp + max_realistic_delta:
+        t_globe_c = dry_bulb_temp + max_realistic_delta
+    
+    return t_globe_c
+
+
+def calculate_mrt(globe_temp, dry_bulb_temp, wind_speed, ghi, solar_elevation):
+    """
+    Calculates Mean Radiant Temperature (MRT) from globe temperature.
+    """
+    GLOBE_DIAMETER = 0.15
+    GLOBE_EMISSIVITY = 0.95
+    STEFAN_BOLTZMANN = 5.67e-8
+    
+    t_globe_k = globe_temp + 273.15
+    t_air_k = dry_bulb_temp + 273.15
+    
+    effective_wind = max(0.1, wind_speed)
+    h_c = 6.3 * (effective_wind**0.6) / (GLOBE_DIAMETER**0.4)
+    
+    convection_term = (h_c / (GLOBE_EMISSIVITY * STEFAN_BOLTZMANN)) * (t_globe_k - t_air_k)
+    
+    mrt_k_fourth_power = (t_globe_k**4) + convection_term
+    
+    if mrt_k_fourth_power < 0:
+        return globe_temp
+    
+    mrt_k = mrt_k_fourth_power**0.25
+    mrt_c = mrt_k - 273.15
+    
+    if ghi > 0 and solar_elevation > 0:
+        max_mrt = globe_temp + 15
+        min_mrt = globe_temp - 2
+        
+        if mrt_c > max_mrt:
+            mrt_c = max_mrt
+        elif mrt_c < min_mrt:
+            mrt_c = min_mrt
+    else:
+        max_mrt = dry_bulb_temp + 3
+        min_mrt = dry_bulb_temp - 15
+        
+        if mrt_c > max_mrt:
+            mrt_c = max_mrt
+        elif mrt_c < min_mrt:
+            mrt_c = min_mrt
+    
+    if mrt_c > 70 or mrt_c < -50:
+        return dry_bulb_temp if ghi <= 0 else globe_temp
+    
+    return mrt_c
+
+
+def calculate_uhi_effect(population, wind_speed, is_daytime):
+    """
+    Calculates the Urban Heat Island (UHI) effect based on Oke's formula.
+    """
+    if population < 1000:
+        return 0.0
+    
+    uhi_base = 2.0 * math.log10(population) - 4.0
+    uhi_base = max(0.0, min(8.0, uhi_base))
+    
+    wind_factor = max(0.0, 1.0 - 0.1 * wind_speed)
+    time_factor = 0.5 if is_daytime else 1.0
+    
+    return round(uhi_base * wind_factor * time_factor, 2)
+
+
+def interpolate_weather(weather_data, start_dt, end_dt, interval_minutes=60):
+    """
+    Interpolates raw hourly weather data to a consistent time-step.
+    """
+    times = pd.date_range(start=start_dt, end=end_dt, freq=f"{interval_minutes}min")
+    # times will be timezone-aware (start_dt expected UTC)
+    times_ts = np.array([t.timestamp() for t in times])
+
+    weather_timestamps = np.array([entry["dt"] for entry in weather_data])
+    temps = np.array([entry["main"]["temp"] for entry in weather_data])
+    rhs = np.array([entry["main"]["humidity"] for entry in weather_data])
+    winds = np.array([entry["wind"]["speed"] for entry in weather_data])
+    clouds = np.array([entry["clouds"]["all"] for entry in weather_data])
+    pressures = np.array([entry["main"]["pressure"] for entry in weather_data])
+
+    interp_temps = np.interp(times_ts, weather_timestamps, temps)
+    interp_rhs = np.interp(times_ts, weather_timestamps, rhs)
+    interp_winds = np.interp(times_ts, weather_timestamps, winds)
+    interp_clouds = np.interp(times_ts, weather_timestamps, clouds)
+    interp_pressures = np.interp(times_ts, weather_timestamps, pressures)
+
+    return [
+        {
+            "time": pd.Timestamp.fromtimestamp(ts, tz=start_dt.tz),
+            "temp": temp,
+            "rh": rh,
+            "wind": wind,
+            "clouds": cloud,
+            "pressure": pressure,
+            "twb": wet_bulb_tmp(tdb=temp, rh=rh)
+        }
+        for ts, temp, rh, wind, cloud, pressure in zip(times_ts, interp_temps, interp_rhs, interp_winds, interp_clouds, interp_pressures)
+    ]
+
+
+
+def calculate_and_export_wbgt(city_name, lat, lon, apply_uhi=False, population=None, apply_latitude_adj=True):
+    """
+    Calculate WBGT for the next 5 days and save to Excel file with optional 
+    UHI effect and latitude-based climate adaptation adjustment.
+    FIX: Converts UTC calculation time to Local City Time for export.
+    
+    """
+
+    """
+    Calculate WBGT for the next 5 days and save to Excel file with optional 
+    UHI effect and latitude-based climate adaptation adjustment.
+    
+    Parameters:
+    -----------
+    city_name : str
+        Name of the city for the sheet name
+    lat : float
+        Latitude of the location
+    lon : float
+        Longitude of the location
+    apply_uhi : bool, optional
+        Whether to apply Urban Heat Island effect (default: False)
+    population : int, optional
+        City population (required if apply_uhi=True)
+    apply_latitude_adj : bool, optional
+        Whether to apply latitude-based adjustment (default: True)
+    
+    Output Columns:
+    ---------------
+    - time: Timestamp (YYYY-MM-DD HH:MM)
+    - temperature: Air temperature (°C)
+    - relative_humidity: Relative humidity (%)
+    - wind_speed: Wind speed at 10m (m/s)
+    - cloud_cover: Cloud cover (%)
+    - pressure: Atmospheric pressure (hPa)
+    - wet_bulb_temp: Wet bulb temperature (°C)
+    - globe_temp: Black globe temperature (°C)
+    - mrt: Mean radiant temperature (°C)
+    - wbgt_base: Base WBGT (no corrections) (°C)
+    - wbgt_with_uhi: WBGT with UHI correction if applied (°C)
+    - wbgt_latitude_adjusted: WBGT with latitude adjustment (°C)
+    - latitude_adjustment_C: Applied latitude correction (°C)
+    - uhi_effect_C: Applied UHI effect (°C)
+    """    
+    
+    print(f"\n--- Calculating WBGT for {city_name} (Lat: {lat:.2f}°) for the next 5 days ---")
+    
+    # 1. Bepaal de lokale tijdzone van de stad
+    local_timezone = get_timezone(lat, lon)
+    print(f"Timezone detected: {local_timezone}")
+
+    if apply_uhi:
+        print(f"UHI effect will be applied (population: {population:,})")
+    
+    if apply_latitude_adj:
+        lat_adj = calculate_latitude_adjustment(lat)
+        print(f"Latitude adjustment: {lat_adj:+.2f}°C (baseline: 40°)")
+        print(f"  Interpretation: {'Increased vulnerability' if lat_adj < 0 else 'Increased tolerance'}")
+    
+    current_date = datetime.now().strftime('%Y%m%d_%H%M')
+    sheet_name = f"{city_name.replace(' ', '_')}_{current_date}"[:31]
+    excel_filename = "Hera.xlsx"
+    
+    weather_data = get_weather_forecast(lat, lon)
+    if not weather_data:
+        print(f"ERROR: Could not retrieve weather data for {city_name}")
+        return
+    
+    start_dt = pd.Timestamp.now(tz=UTC)
+    end_dt = start_dt + timedelta(days=5)
+    interp_data = interpolate_weather(weather_data, start_dt, end_dt, interval_minutes=60)
+    
+    wbgt_results = []
+    aqi = get_air_quality(lat, lon)
+    
+    latitude_adjustment = calculate_latitude_adjustment(lat) if apply_latitude_adj else 0.0
+    
+    for entry in interp_data:
+        time_utc = entry["time"] # Dit is UTC timestamp
+        temp_base = entry["temp"]
+        rh = entry["rh"]
+        wind = entry["wind"]
+        clouds = entry["clouds"]
+        pressure = entry["pressure"]
+        twb = entry["twb"]
+        
+        # --- CONVERSIE NAAR LOKALE TIJD VOOR EXCEL ---
+        # We converteren de UTC tijd naar de tijdzone van de stad
+        time_local = time_utc.tz_convert(local_timezone)
+        
+        # UHI Logic (gebruikt nu lokale uren om dag/nacht te bepalen)
+        if apply_uhi:
+            is_daytime = 6 <= time_local.hour < 18
+            uhi_effect = calculate_uhi_effect(population, wind, is_daytime)
+            temp_with_uhi = temp_base + uhi_effect
+        else:
+            uhi_effect = 0.0
+            temp_with_uhi = temp_base
+        
+        # Let op: calculate_solar_radiance verwacht de tijd en handelt zelf conversie af,
+        # maar we geven hier voor de zekerheid de UTC string door zoals voorheen, 
+        # want die functie converteert intern ook.
+        radiance = calculate_solar_radiance(lat, lon, str(time_utc), clouds, aqi)
+        wind_1_5m = wind_speed_at_height(wind, 10, 1.5)
+        
+        globe_temp = calculate_globe_temperature(
+            temp_with_uhi, radiance['ghi'], wind_1_5m, 
+            radiance['solar_elevation'], pressure, clouds, aqi
+        )
+        
+        mrt = calculate_mrt(
+            globe_temp, temp_with_uhi, wind_1_5m, 
+            radiance['ghi'], radiance['solar_elevation']
+        )
+        
+        with_solar_load = bool(radiance['ghi'] > 0 and radiance['solar_elevation'] > 0)
+        wbgt_args = {
+            "twb": wet_bulb_tmp(tdb=temp_base, rh=rh),
+            "tg": calculate_globe_temperature(
+                temp_base, radiance['ghi'], wind_1_5m,
+                radiance['solar_elevation'], pressure, clouds, aqi
+            ),
+            "with_solar_load": with_solar_load,
+            "round_output": True
+        }
+        if with_solar_load:
+            wbgt_args["tdb"] = temp_base
+        
+        wbgt_base = float(wbgt(**wbgt_args).wbgt)
+        
+        if apply_uhi:
+            wbgt_args_uhi = {
+                "twb": wet_bulb_tmp(tdb=temp_with_uhi, rh=rh),
+                "tg": globe_temp,
+                "with_solar_load": with_solar_load,
+                "round_output": True
+            }
+            if with_solar_load:
+                wbgt_args_uhi["tdb"] = temp_with_uhi
+            wbgt_with_uhi = float(wbgt(**wbgt_args_uhi).wbgt)
+        else:
+            wbgt_with_uhi = wbgt_base
+        
+        wbgt_latitude_adjusted = wbgt_with_uhi - latitude_adjustment
+        
+        wbgt_results.append({
+            # HIER ZIT DE FIX: Gebruik time_local en format zonder timezone info voor Excel
+            "time": time_local.strftime('%Y-%m-%d %H:%M'), 
+            "temperature": round(temp_base, 2),
+            "relative_humidity": round(rh, 1),
+            "wind_speed": round(wind, 2),
+            "cloud_cover": round(clouds, 1),
+            "pressure": round(pressure, 1),
+            "wet_bulb_temp": round(twb, 2),
+            "globe_temp": round(globe_temp, 2),
+            "mrt": round(mrt, 2),
+            "wbgt_base": round(wbgt_base, 2),
+            "wbgt_with_uhi": round(wbgt_with_uhi, 2),
+            "wbgt_latitude_adjusted": round(wbgt_latitude_adjusted, 2),
+            "latitude_adjustment_C": round(latitude_adjustment, 2),
+            "uhi_effect_C": round(uhi_effect, 2)
+        })
+    
+    print(f"\n[INFO] Exporting WBGT data to '{excel_filename}', sheet: '{sheet_name}'...")
+    try:
+        wbgt_df = pd.DataFrame(wbgt_results)
+        
+        writer = None
+        try:
+            if os.path.exists(excel_filename):
+                writer = pd.ExcelWriter(excel_filename, engine='openpyxl', mode='a', 
+                                      if_sheet_exists='replace')
+            else:
+                writer = pd.ExcelWriter(excel_filename, engine='openpyxl', mode='w')
+            
+            wbgt_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            writer.close()
+            
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except:
+                    pass
+        
+        print(f"[SUCCESS] WBGT data for {city_name} successfully exported")
+        print(f"  - Timezone used: {local_timezone}")
+        print(f"  - Total records: {len(wbgt_df)}")
+        
+    except Exception as e:
+        print(f"[ERROR] Could not export to Excel: {e}")
+        import traceback
+        traceback.print_exc()
+
+def main():
+    """Main function to run HERA."""
+    print("\n=== HERA: Heat Exposure Risk Assessment ===\n")
+    
+    try:
+        city_name = input("Enter the city name (e.g., Amsterdam, Sydney): ")
+        lat, lon = get_lat_lon(city_name)
+        if lat is None or lon is None:
+            print(f"ERROR: Could not retrieve coordinates for {city_name}")
+            return
+        
+        print(f"Location: {city_name} ({lat:.2f}°, {lon:.2f}°)")
+        
+        apply_uhi = input("Apply Urban Heat Island (UHI) effect? (y/n) [n]: ").lower().strip()
+        apply_uhi = apply_uhi == 'y'
+        population = None
+        if apply_uhi:
+            population = int(input("Enter the city's population (e.g., 800000 for Amsterdam): "))
+        
+        apply_latitude = input("Apply latitude-based climate adaptation adjustment? (y/n) [y]: ").lower().strip()
+        apply_latitude = apply_latitude != 'n'
+        
+        calculate_and_export_wbgt(
+            city_name, lat, lon, 
+            apply_uhi=apply_uhi, 
+            population=population,
+            apply_latitude_adj=apply_latitude
+        )
+        
+        print("\n=== HERA Analysis Complete ===")
+        
+    except ValueError as e:
+        print(f"ERROR: Invalid input - {e}")
+    except Exception as e:
+        print(f"ERROR: An unexpected error occurred - {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
