@@ -1,0 +1,617 @@
+"""
+PYROX Phase 1 — REV08 (Paper-conform + 5-day forecast + JSON Timestamp FIX)
+- REV07 features plus:
+  * Fixed JSON crash by dropping temporary Timestamp column before export
+  * Strictly conform UHI logic
+"""
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import pytz
+from timezonefinder import TimezoneFinder
+import pvlib
+from pythermalcomfort.utilities import wet_bulb_tmp
+from pythermalcomfort.models import wbgt
+from functools import lru_cache
+import math
+import json
+from tqdm import tqdm
+
+# ---------------------- Utilities ----------------------
+@lru_cache(maxsize=256)
+def geocode_city_open_meteo(city_name):
+    url = "https://geocoding-api.open-meteo.com/v1/search"
+    params = {"name": city_name, "count": 5, "format": "json", "language": "en"}
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("results", [])
+    except Exception as e:
+        print(f"[ERROR] Geocoding failed: {e}")
+        return []
+
+@lru_cache(maxsize=256)
+def get_timezone(lat, lon):
+    tf = TimezoneFinder()
+    tzname = tf.timezone_at(lat=lat, lng=lon)
+    return pytz.timezone(tzname) if tzname else pytz.UTC
+
+@lru_cache(maxsize=256)
+def _map_us_aqi_to_1_5(us_aqi):
+    if us_aqi is None:
+        return 1
+    try:
+        us_aqi = float(us_aqi)
+    except:
+        return 1
+    if us_aqi <= 50: return 1
+    if us_aqi <= 100: return 2
+    if us_aqi <= 150: return 3
+    if us_aqi <= 200: return 4
+    return 5
+
+@lru_cache(maxsize=256)
+def get_air_quality_open_meteo(lat, lon):
+    url = f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat}&longitude={lon}&current=us_aqi&timezone=UTC"
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        js = r.json()
+        us_aqi = js.get("current", {}).get("us_aqi", None)
+        return _map_us_aqi_to_1_5(us_aqi)
+    except Exception:
+        return 1
+
+# ---------------------- Data fetch (historical archive) ----------------------
+def fetch_open_meteo_archive_hourly(lat, lon, start_date="1991-01-01", end_date="2020-12-31"):
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,cloud_cover,surface_pressure",
+        "timezone": "UTC",
+        "wind_speed_unit": "ms"
+    }
+    print(f"[INFO] Requesting archive data {start_date} -> {end_date} ...")
+    try:
+        r = requests.get(url, params=params, timeout=180)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[ERROR] API Request failed: {e}")
+        return pd.DataFrame()
+
+    data = r.json()
+    hourly = data.get("hourly", {})
+    times = hourly.get("time", [])
+    if not times:
+        print("[ERROR] No data received from API.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame({
+        'time_utc': pd.to_datetime(hourly.get('time', [])),
+        'temp': hourly.get('temperature_2m', []),
+        'rh': hourly.get('relative_humidity_2m', []),
+        'wind_10m': hourly.get('wind_speed_10m', []),
+        'clouds': hourly.get('cloud_cover', []),
+        'pressure': hourly.get('surface_pressure', [])
+    })
+
+    # Convert wind 10m -> approx 2m
+    df['wind'] = pd.to_numeric(df['wind_10m'], errors='coerce') * 0.75
+    df['temp'] = pd.to_numeric(df['temp'], errors='coerce')
+    df['rh'] = pd.to_numeric(df['rh'], errors='coerce')
+    df['clouds'] = pd.to_numeric(df['clouds'], errors='coerce').fillna(0)
+    df['pressure'] = pd.to_numeric(df['pressure'], errors='coerce').fillna(1013.0)
+
+    df = df.set_index('time_utc')
+    df.index = df.index.tz_localize(pytz.UTC)
+    return df
+
+# ---------------------- Forecast fetch (5-day) ----------------------
+def fetch_open_meteo_forecast_hourly(lat, lon, forecast_days=5):
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m,cloud_cover,surface_pressure",
+        "forecast_days": forecast_days,
+        "timezone": "UTC",
+        "wind_speed_unit": "ms"
+    }
+    print(f"[INFO] Requesting {forecast_days}-day forecast from Open-Meteo ...")
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[ERROR] Forecast request failed: {e}")
+        return pd.DataFrame()
+
+    js = r.json()
+    hourly = js.get("hourly", {})
+    times = hourly.get("time", [])
+    if not times:
+        print("[ERROR] No forecast data received.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame({
+        'time_utc': pd.to_datetime(hourly.get('time', [])),
+        'temp': hourly.get('temperature_2m', []),
+        'rh': hourly.get('relative_humidity_2m', []),
+        'wind_10m': hourly.get('wind_speed_10m', []),
+        'clouds': hourly.get('cloud_cover', []),
+        'pressure': hourly.get('surface_pressure', [])
+    })
+    df['wind'] = pd.to_numeric(df['wind_10m'], errors='coerce') * 0.75
+    df['temp'] = pd.to_numeric(df['temp'], errors='coerce')
+    df['rh'] = pd.to_numeric(df['rh'], errors='coerce')
+    df['clouds'] = pd.to_numeric(df['clouds'], errors='coerce').fillna(0)
+    df['pressure'] = pd.to_numeric(df['pressure'], errors='coerce').fillna(1013.0)
+
+    df = df.set_index('time_utc')
+    df.index = df.index.tz_localize(pytz.UTC)
+    return df
+
+# ---------------------- Solar computation (shared) ----------------------
+@lru_cache(maxsize=128)
+def compute_solar_series_cached(lat, lon, start_iso, end_iso, linke):
+    tz = get_timezone(lat, lon)
+    times_utc = pd.date_range(start=pd.to_datetime(start_iso), end=pd.to_datetime(end_iso), freq='1h', tz=pytz.UTC)
+    location = pvlib.location.Location(lat, lon, tz=tz.zone)
+    try:
+        sp = location.get_solarposition(times_utc)
+        clearsky = location.get_clearsky(times_utc, model='ineichen', linke_turbidity=linke)
+    except Exception:
+        out = pd.DataFrame(index=times_utc)
+        out['apparent_zenith'] = 90.0
+        out['elevation'] = -90.0
+        out['azimuth'] = 0.0
+        out['ghi_clearsky'] = 0.0
+        out['dni_clearsky'] = 0.0
+        out['dhi_clearsky'] = 0.0
+        return out
+
+    out = pd.DataFrame(index=times_utc)
+    out['apparent_zenith'] = sp['apparent_zenith']
+    out['elevation'] = sp['elevation']
+    out['azimuth'] = sp['azimuth']
+    out['ghi_clearsky'] = clearsky['ghi']
+    out['dni_clearsky'] = clearsky['dni']
+    out['dhi_clearsky'] = clearsky['dhi']
+    return out
+
+def calculate_solar_radiance_vectorized(lat, lon, df_local, aqi):
+    if df_local.empty:
+        return df_local.assign(ghi=0.0, dni=0.0, dhi=0.0, solar_elevation=-90.0)
+
+    linke = 2.5 if aqi <= 2 else 4.0 if aqi <= 4 else 6.0
+    start_iso = df_local.index[0].tz_convert(pytz.UTC).isoformat()
+    end_iso = df_local.index[-1].tz_convert(pytz.UTC).isoformat()
+
+    sol = compute_solar_series_cached(round(lat,4), round(lon,4), start_iso, end_iso, linke)
+    df_utc = df_local.tz_convert(pytz.UTC)
+    joined = df_utc.join(sol, how='left')
+    joined = joined.fillna({'ghi_clearsky':0.0,'dni_clearsky':0.0,'dhi_clearsky':0.0,'elevation':-90.0,'apparent_zenith':90.0})
+
+    cloud_frac = joined['clouds'].clip(0,100)/100.0
+    clear_frac = (1.0 - cloud_frac).clip(0.1,1.0)
+    joined['dni'] = joined['dni_clearsky'] * clear_frac
+    joined['dhi'] = joined['dhi_clearsky'] * (1.0 + (1.0 - clear_frac)*0.5)
+    joined['ghi'] = (joined['dni'] * 0.25) + joined['dhi']
+    joined['solar_elevation'] = joined['elevation']
+    joined[['ghi','dni','dhi']] = joined[['ghi','dni','dhi']].clip(lower=0)
+    out = joined.tz_convert(df_local.index.tz).loc[df_local.index][['ghi','dni','dhi','solar_elevation']]
+    return out
+
+# ---------------------- Globe temperature (shared) ----------------------
+def calculate_globe_temperature(dry, ghi, wind, sol_elev, pressure, clouds, aqi):
+    eps = 0.95
+    sigma = 5.67e-8
+    alpha = 0.95
+    G_D = 0.15
+    t_air_k = dry + 273.15
+    wind_eff = max(0.1, wind)
+    h_c = 6.3 * (wind_eff**0.6) / (G_D**0.4)
+    if ghi <= 0 or sol_elev <= 0:
+        sky_dep = 10 - (clouds/100)*6
+        if aqi > 3:
+            sky_dep -= 2
+        sky_temp = t_air_k - sky_dep
+        delta = - (eps*sigma*(t_air_k**4 - sky_temp**4)) / (h_c + 4*eps*sigma*t_air_k**3)
+        return float(np.clip(dry + delta, dry-5, dry+1))
+    S = alpha * ghi / 4
+    t_globe = t_air_k + S/(h_c + 4*eps*sigma*t_air_k**3)
+    for _ in range(8):
+        rad = eps*sigma*(t_globe**4 - t_air_k**4)
+        conv = h_c*(t_globe - t_air_k)
+        imbalance = S - rad - conv
+        if abs(imbalance) < 0.05:
+            break
+        der = - (4*eps*sigma*(t_globe**3) + h_c)
+        t_globe -= imbalance / der
+    tg_c = t_globe - 273.15
+    tg_c = max(tg_c, dry)
+    tg_c = min(tg_c, dry + (25 if wind_eff < 1 else 15))
+    return float(tg_c)
+
+# ---------------------- UHI model (REV07 Corrected) ----------------------
+def estimate_uhi(population=500000, wind=2.0, is_day=True):
+    """
+    Calculates Urban Heat Island effect strictly according to Whitepaper Source 1.
+    T_effective = T_air + UHI(population, wind, is_day)
+    
+    Formula:
+    uhi_base = 2 * log10(population) - 4   (capped 0–8°C)
+    wind_factor = max(0, 1 - 0.1 * wind_speed)
+    time_factor = 0.5 (day) or 1.0 (night)
+    UHI = uhi_base * wind_factor * time_factor
+    """
+    # 1. Base UHI (Population based)
+    # Using max(100, pop) to prevent math domain error on log10(0)
+    base = 2.0 * math.log10(max(100, population)) - 4.0
+    
+    # Cap between 0 and 8°C as per whitepaper
+    #cap changed to 5
+    base = max(0.0, min(5.0, base))
+    
+    # 2. Wind Factor
+    # Whitepaper: max(0, 1 - 0.1 * wind_speed)
+    wind_factor = max(0.0, 1.0 - 0.1 * wind)
+    
+    # 3. Time Factor
+    # Whitepaper: 0.5 (day) or 1.0 (night)
+    time_factor = 0.5 if is_day else 1.0
+    
+    return base * wind_factor * time_factor
+
+# ---------------------- Helper: find best consecutive 3-month window (WBGT) ----------------------
+def find_best_3month_window_from_wbgt(summary_df):
+    wbgt_month = summary_df['wbgt_mean'].to_dict()
+    best_mean = -np.inf
+    best_start = None
+    for start in range(1,13):
+        months = [((start + i - 1) % 12) + 1 for i in range(3)]
+        vals = [wbgt_month.get(m, np.nan) for m in months]
+        if np.any(np.isnan(vals)):
+            continue
+        mmean = float(np.mean(vals))
+        if mmean > best_mean:
+            best_mean = mmean
+            best_start = start
+    if best_start is None:
+        return [], np.nan
+    window_months = [((best_start + i - 1) % 12) + 1 for i in range(3)]
+    return window_months, float(best_mean)
+
+# ---------------------- Risk classification ----------------------
+def classify_pyrox_risk(pyrox_value):
+    if np.isnan(pyrox_value):
+        return "UNKNOWN"
+    if pyrox_value < 27:
+        return "LOW"
+    if pyrox_value < 29:
+        return "MODERATE"
+    if pyrox_value < 32:
+        return "HIGH"
+    return "EXTREME"
+
+# ---------------------- Process forecast ----------------------
+def process_forecast(lat, lon, name=None, apply_uhi=False, population_for_uhi=500000, pyrox_delta=0.0, export=True):
+    # Fetch forecast (UTC)
+    df_fc = fetch_open_meteo_forecast_hourly(lat, lon, forecast_days=5)
+    if df_fc.empty:
+        print("[WARN] Forecast DF empty.")
+        return pd.DataFrame(), {}
+
+    aqi = get_air_quality_open_meteo(lat, lon)
+    tz = get_timezone(lat, lon)
+    df_local = df_fc.tz_convert(tz)
+
+    # Add solar
+    solar = calculate_solar_radiance_vectorized(lat, lon, df_local, aqi)
+    df_local = df_local.join(solar)
+
+    # UHI per-hour if requested
+    if apply_uhi:
+        df_local['uhi'] = df_local.apply(lambda r: estimate_uhi(population_for_uhi, r.get('wind',2.0), r.get('solar_elevation',-90.0)>5), axis=1)
+        df_local['temp_adj'] = df_local['temp'] + df_local['uhi']
+    else:
+        df_local['uhi'] = 0.0
+        df_local['temp_adj'] = df_local['temp']
+
+    # compute WBGT per hour
+    rows = []
+    for idx, row in df_local.iterrows():
+        Ta = row['temp_adj']
+        RH = row['rh']
+        wind = row['wind']
+        ghi = row.get('ghi', 0.0)
+        se = row.get('solar_elevation', -90.0)
+        clouds = row['clouds']
+        pressure = row['pressure']
+        if np.isnan(Ta) or np.isnan(RH):
+            continue
+        try:
+            twb = float(wet_bulb_tmp(tdb=Ta, rh=RH))
+        except:
+            twb = Ta
+        tg = calculate_globe_temperature(Ta, ghi, wind, se, pressure, clouds, aqi)
+        with_solar = bool(ghi > 10 and se > 5)
+        try:
+            wbgt_val = float(wbgt(twb=twb, tg=tg, tdb=Ta, with_solar_load=with_solar, wind_speed=float(wind), round_output=False).wbgt)
+        except:
+            wbgt_val = 0.7*twb + 0.2*tg + 0.1*Ta
+        pyrox_val = wbgt_val - pyrox_delta
+        risk = classify_pyrox_risk(pyrox_val)
+        rows.append({
+            'time': idx.isoformat(),
+            'time_local': idx.tz_convert(tz).isoformat(),
+            'Ta': float(row['temp']),
+            'Ta_adj': float(Ta),
+            'uhi': float(row['uhi']),
+            'rh': float(RH),
+            'wind': float(wind),
+            'ghi': float(ghi),
+            'tg': float(tg),
+            'twb': float(twb),
+            'wbgt': float(wbgt_val),
+            'pyrox': float(pyrox_val),
+            'risk': risk
+        })
+
+    df_out = pd.DataFrame(rows)
+    if df_out.empty:
+        print("[WARN] No valid forecast rows.")
+        return pd.DataFrame(), {}
+
+    # daily summary
+    df_out['time_local_dt'] = pd.to_datetime(df_out['time_local'])
+    df_out['date'] = df_out['time_local_dt'].dt.strftime('%Y-%m-%d')
+    
+    daily = df_out.groupby('date').agg(
+        max_WBGT=('wbgt','max'), 
+        max_PYROX=('pyrox','max'), 
+        max_risk=('risk', lambda s: s.mode().iloc[0] if not s.mode().empty else 'UNKNOWN')
+    ).reset_index()
+
+    # !!! FIX: Drop the Timestamp object column before JSON export !!!
+    df_json = df_out.drop(columns=['time_local_dt'])
+
+    out = {
+        'location': name or f'{lat},{lon}',
+        'lat': lat,
+        'lon': lon,
+        'apply_uhi': bool(apply_uhi),
+        'population_for_uhi': int(population_for_uhi) if apply_uhi else None,
+        'pyrox_delta': float(pyrox_delta),
+        'hourly': df_json.to_dict(orient='records'),
+        'daily_summary': daily.to_dict(orient='records')
+    }
+
+    if export:
+        safe = (name or f'{lat}_{lon}').replace(' ','_')
+        fname = f"{safe}_forecast_pyrox_rev08.json"
+        df_out.to_csv(f"{safe}_forecast_pyrox_rev08.csv", index=False)
+        with open(fname, 'w') as fh:
+            json.dump(out, fh, indent=2)
+        print(f"[INFO] Forecast saved: {fname} and {safe}_forecast_pyrox_rev08.csv")
+
+    return df_out, out
+
+# ---------------------- Main historical processing ----------------------
+def process_location(lat, lon, name=None, start_date='1991-01-01', end_date='2020-12-31',
+                     apply_uhi=False, population_for_uhi=500000, infrastructure_level='none', export=True):
+    df = fetch_open_meteo_archive_hourly(lat, lon, start_date=start_date, end_date=end_date)
+    if df.empty:
+        print("No data")
+        return pd.DataFrame(), {}
+
+    aqi = get_air_quality_open_meteo(lat, lon)
+    tz = get_timezone(lat, lon)
+    df_local = df.tz_convert(tz)
+    solar = calculate_solar_radiance_vectorized(lat, lon, df_local, aqi)
+    df_local = df_local.join(solar)
+
+    if apply_uhi:
+        df_local['uhi'] = df_local.apply(lambda r: estimate_uhi(population_for_uhi, r.get('wind',2.0), r.get('solar_elevation',-90.0)>5), axis=1)
+        print(f"\n[INFO] UHI applied per-hour using population={population_for_uhi}. Mean hourly UHI = {df_local['uhi'].mean():.2f}°C")
+        df_local['temp_adj'] = df_local['temp'] + df_local['uhi']
+    else:
+        df_local['uhi'] = 0.0
+        df_local['temp_adj'] = df_local['temp']
+        print("\n[INFO] UHI not applied; using raw temperatures for WBGT calculation.")
+
+    monthly_stats = {m: {'temp':[], 'rh':[], 'wind':[], 'wbgt':[]} for m in range(1,13)}
+    print("[INFO] Computing hourly WBGT (uses temp_adj for Twb/Tg/WBGT)...")
+    for idx, row in tqdm(df_local.iterrows(), total=len(df_local), desc='Computing WBGT', unit='hr'):
+        orig_Ta = row['temp']
+        Ta = row.get('temp_adj', orig_Ta)
+        RH = row['rh']
+        wind = row['wind']
+        clouds = row['clouds']
+        pressure = row['pressure']
+        ghi = row.get('ghi', 0.0)
+        sol_elev = row.get('solar_elevation', -90.0)
+        if np.isnan(orig_Ta) or np.isnan(RH):
+            continue
+        try:
+            twb = float(wet_bulb_tmp(tdb=Ta, rh=RH))
+        except Exception:
+            twb = Ta
+        tg = calculate_globe_temperature(Ta, ghi, wind, sol_elev, pressure, clouds, aqi)
+        with_solar = (ghi > 10) & (sol_elev > 5)
+        try:
+            wbgt_val = float(wbgt(twb=twb, tg=tg, tdb=Ta, with_solar_load=bool(with_solar), wind_speed=float(wind), round_output=False).wbgt)
+        except Exception:
+            wbgt_val = 0.7*twb + 0.2*tg + 0.1*Ta
+        m = idx.month
+        monthly_stats[m]['temp'].append(orig_Ta)
+        monthly_stats[m]['rh'].append(RH)
+        monthly_stats[m]['wind'].append(wind)
+        monthly_stats[m]['wbgt'].append(wbgt_val)
+
+    summary_rows = []
+    for m in range(1,13):
+        vals = monthly_stats[m]
+        if len(vals['wbgt']) == 0:
+            summary_rows.append({'month':m,'month_name':datetime(2000,m,1).strftime('%b'),'n_hours':0,
+                                  'temp_mean':np.nan,'rh_mean':np.nan,'wind_mean':np.nan,
+                                  'wbgt_mean':np.nan,'wbgt_max':np.nan,'wbgt_p90':np.nan})
+            continue
+        wbgt_arr = np.array(vals['wbgt'])
+        summary_rows.append({
+            'month':m,'month_name':datetime(2000,m,1).strftime('%b'),'n_hours':len(wbgt_arr),
+            'temp_mean':np.mean(vals['temp']),'rh_mean':np.mean(vals['rh']),'wind_mean':np.mean(vals['wind']),
+            'wbgt_mean':np.mean(wbgt_arr),'wbgt_max':np.max(wbgt_arr),'wbgt_p90':np.percentile(wbgt_arr,90)
+        })
+    summary_df = pd.DataFrame(summary_rows).set_index('month')
+
+    print(f"\n--- Monthly climatology for {name or f'{lat},{lon}'} ({start_date}–{end_date}) ---")
+    for _, r in summary_df.iterrows():
+        if r['n_hours'] == 0:
+            print(f"{r['month_name']}: No data")
+        else:
+            print(f"{r['month_name']}: T_avg={r['temp_mean']:.2f}C, RH={r['rh_mean']:.0f}%, Wind={r['wind_mean']:.1f} m/s | WBGT_avg={r['wbgt_mean']:.2f}C (Max={r['wbgt_max']:.1f}C, P90={r['wbgt_p90']:.2f}C)")
+
+    warm_months, wbgt_summer = find_best_3month_window_from_wbgt(summary_df)
+    warm_month_names = [datetime(2000,m,1).strftime('%B') for m in warm_months]
+    if warm_months:
+        print(f"\n>>> Warm season (3 consecutive months by WBGT): {warm_month_names} -> WBGT_summer = {wbgt_summer:.2f}°C")
+    else:
+        print("\n>>> Could not determine warm season (insufficient monthly data).")
+
+    top3_by_temp = summary_df.dropna(subset=['temp_mean']).sort_values('temp_mean', ascending=False).head(3)
+    top3_months_temp = list(top3_by_temp.index)
+    top3_month_names_temp = [datetime(2000,m,1).strftime('%B') for m in top3_months_temp]
+    mean_temp_top3 = float(top3_by_temp['temp_mean'].mean()) if not top3_by_temp.empty else np.nan
+    mean_wbgt_top3 = float(top3_by_temp['wbgt_mean'].mean()) if not top3_by_temp.empty else np.nan
+
+    print("\n>>> Top 3 months by mean air temperature (for reporting):")
+    for m in top3_months_temp:
+        print(f"   {datetime(2000,m,1).strftime('%B')}: T_avg={summary_df.loc[m,'temp_mean']:.2f}°C")
+
+    correction_lookup = {'none':1.0, 'low':0.95, 'medium':0.85, 'high':0.70}
+    cf = correction_lookup.get(infrastructure_level, 1.0)
+
+    WBGT_REF = 18.0
+    if not np.isnan(wbgt_summer):
+        wbgt_experienced = WBGT_REF + (wbgt_summer - WBGT_REF) * cf
+        delta = (wbgt_experienced - WBGT_REF) * 0.10
+        delta = max(-1.0, min(1.0, delta))
+    else:
+        wbgt_experienced = np.nan
+        delta = np.nan
+
+    print(f"\n[INFO] Infrastructure level = {infrastructure_level} (cf={cf})")
+    print(f"[INFO] WBGT_summer = {wbgt_summer:.2f}°C, WBGT_experienced = {wbgt_experienced:.2f}°C, PYROX delta = {delta:.3f}")
+
+    out_json = {
+        'location': name or f'{lat},{lon}',
+        'lat': lat,
+        'lon': lon,
+        'start_date': start_date,
+        'end_date': end_date,
+        'apply_uhi': bool(apply_uhi),
+        'population_for_uhi': int(population_for_uhi) if apply_uhi else None,
+        'mean_hourly_uhi': float(df_local['uhi'].mean()) if 'uhi' in df_local else 0.0,
+        'warm_season_months': warm_months,
+        'warm_season_month_names': warm_month_names,
+        'wbgt_summer': wbgt_summer,
+        'wbgt_experienced': wbgt_experienced,
+        'pyrox_delta': delta,
+        'top3_months_by_temp': top3_months_temp,
+        'top3_month_names_by_temp': top3_month_names_temp,
+        'mean_temp_top3': mean_temp_top3,
+        'mean_wbgt_top3': mean_wbgt_top3
+    }
+
+    if export:
+        safe_name = (name or f'{lat}_{lon}').replace(' ','_')
+        csv_name = f"{safe_name}_wbgt_monthly_climatology_rev08.csv"
+        json_name = f"{safe_name}_acclimatisation_rev08.json"
+        summary_df.to_csv(csv_name)
+        with open(json_name,'w') as fh:
+            json.dump(out_json, fh, indent=2)
+        print(f"\nSaved: {csv_name} and {json_name}")
+
+    return summary_df, out_json
+
+# ---------------------- Interactive CLI ----------------------
+def interactive():
+    print("PYROX Phase 1 — REV08 (paper-conform + 5-day forecast + JSON Timestamp FIX)")
+
+    while True:
+        city = input('\nCity (or q): ').strip()
+        if city.lower() in ('q','quit','exit'):
+            break
+        if not city:
+            continue
+        results = geocode_city_open_meteo(city)
+        if not results:
+            print('No matches.')
+            continue
+        if len(results)==1:
+            choice = 0
+        else:
+            print('Matches:')
+            for i,r in enumerate(results,1):
+                country = r.get('country','')
+                admin = r.get('admin1','')
+                print(f"{i}. {r['name']}, {admin}, {country} ({r['latitude']:.3f}, {r['longitude']:.3f})")
+            s = input('Choose: ').strip()
+            try:
+                choice = int(s)-1
+                if choice<0 or choice>=len(results): continue
+            except:
+                continue
+        loc = results[choice]
+        lat = loc['latitude']
+        lon = loc['longitude']
+        name = loc['name']
+        print(f"\nSelected: {name} ({lat},{lon})")
+
+        # Historical climatology
+        uhi_choice = input("Apply UHI for climatology? (y/n): ").strip().lower()
+        apply_uhi = (uhi_choice == 'y')
+        pop = 500000
+        if apply_uhi:
+            inp = input("Population (default 500000): ").strip()
+            try:
+                if inp:
+                    pop = int(inp)
+            except:
+                print("Invalid population input; using default 500000.")
+        infra = input("Infrastructure level (none/low/medium/high) [none]: ").strip().lower()
+        if infra not in ('none','low','medium','high'):
+            infra = 'none'
+
+        summary_df, out_json = process_location(lat, lon, name=name, apply_uhi=apply_uhi, population_for_uhi=pop, infrastructure_level=infra)
+
+        # Ask user whether to run forecast using computed delta
+        run_fc = input("\nRun 5-day PYROX forecast using computed PYROX delta? (y/n): ").strip().lower()
+        if run_fc == 'y':
+            uhi_fc_choice = input("Apply UHI to forecast? (y/n) [same as climatology]: ").strip().lower()
+            apply_uhi_fc = (uhi_fc_choice == 'y') if uhi_fc_choice in ('y','n') else apply_uhi
+            pop_fc = pop
+            if apply_uhi_fc:
+                inp2 = input(f"Population for forecast (default {pop_fc}): ").strip()
+                try:
+                    if inp2:
+                        pop_fc = int(inp2)
+                except:
+                    print("Invalid input; using previous population.")
+            pyrox_delta = out_json.get('pyrox_delta', 0.0)
+            df_forecast, out_forecast = process_forecast(lat, lon, name=name, apply_uhi=apply_uhi_fc, population_for_uhi=pop_fc, pyrox_delta=pyrox_delta)
+            
+            if out_forecast:
+                print("\nForecast daily summary:")
+                for d in out_forecast['daily_summary']:
+                    print(f" {d['date']}: max_WBGT={d['max_WBGT']:.2f}, max_PYROX={d['max_PYROX']:.2f}, max_risk={d['max_risk']}")
+        else:
+            print("Skipping forecast.")
+
+if __name__ == '__main__':
+    interactive()
