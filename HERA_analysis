@@ -1,0 +1,399 @@
+"""
+Created on Sat Nov 15 17:00:10 2025
+
+@author: deboe
+"""
+
+# HERA_analysis_tool.py
+# Add-on analysis module for HERA that reads Hera.xlsx (produced by HERA)
+# and performs activity safety analysis for multiple vulnerability profiles.
+# - Console UI: choose sheet, with/without UHI, MET activity
+# - Uses ACSM-based safe WBGT limits per MET
+# - Produces per-profile Excel sheets and plots, and a comparative plot
+#
+# Usage:
+#   python HERA_analysis_tool.py
+#
+# File expects Hera.xlsx in the same folder (created by HERA).
+# Date: 2025-11-03
+
+from datetime import datetime
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, Any, List, Optional, Tuple
+import math
+import warnings
+
+# Suppress openpyxl warnings about sheet names > 31 characters (from existing sheets)
+warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
+
+# ------------------------------
+# Vulnerability adjustments and classifier (copied/compatible with HERA)
+# ------------------------------
+VULNERABILITY_ADJUSTMENTS = {
+    'age_group': {
+        '0-5': -2.5, '6-12': -2.0, '13-17': -1.0, '18-29': -0.5, '30-49': 0.0,
+        '50-64': -0.5, '65-74': -1.5, '75+': -2.5, '65+_dementia': -3.5, '75+_dementia': -4.0
+    },
+    'pregnancy_status': {'not_pregnant': 0.0, 'first_trimester': -1.0, 'second_trimester': -1.5, 'third_trimester': -2.5, 'high_risk_pregnancy': -3.0, 'multiple_pregnancy': -2.0, 'postpartum_6weeks': -1.0},
+    'fitness_level': {'elite_athlete': +2.5, 'highly_trained': +2.0, 'moderately_fit': +1.0, 'average': 0.0, 'low_fitness': -1.0, 'sedentary': -1.5, 'deconditioned': -2.0},
+    'heat_acclimatization': {'fully_acclimatized': +2.5, 'well_acclimatized': +2.0, 'partially_acclimatized': +1.0, 'minimally_acclimatized': 0.0, 'non_acclimatized': -1.5, 'cold_adapted': -2.0},
+    'health_status': {'excellent': +0.5, 'good': 0.0, 'cardiovascular_disease': -2.5, 'respiratory_disease': -2.0, 'diabetes_controlled': -1.5, 'diabetes_uncontrolled': -2.5, 'obesity_moderate': -1.5, 'obesity_severe': -2.5, 'hypertension': -1.0, 'kidney_disease': -2.0, 'neurological': -2.0, 'dementia_mild': -2.5, 'dementia_moderate': -3.0, 'dementia_severe': -3.5, 'alzheimer_early': -2.5, 'alzheimer_advanced': -3.5, 'gestational_diabetes': -1.5, 'preeclampsia': -2.5, 'placenta_complications': -2.0},
+    'medication_use': {'none': 0.0, 'diuretics': -1.5, 'beta_blockers': -1.5, 'anticholinergics': -2.0, 'antipsychotics': -1.5, 'antihistamines': -1.0, 'multiple_medications': -2.0, 'dementia_medications': -2.5},
+    'hydration_status': {'well_hydrated': +0.5, 'normal': 0.0, 'mild_dehydration': -1.0, 'moderate_dehydration': -2.0, 'severe_dehydration': -3.0, 'impaired_thirst': -2.5},
+    'clothing': {'minimal_light': +1.0, 'light_athletic': 0.0, 'moderate': -0.5, 'heavy': -1.5, 'protective_gear': -2.5},
+    'work_intensity': {'rest': +2.0, 'light_work': +1.0, 'moderate_work': 0.0, 'heavy_work': -1.5, 'very_heavy_work': -2.5}
+}
+
+def climate_offset(mean_temp_annual: float, baseline: float = 20.0) -> float:
+    return 0.2 * (mean_temp_annual - baseline)
+
+
+def truncate_sheet_name(name: str, max_length: int = 31) -> str:
+    """Truncate sheet name to Excel's 31 character limit"""
+    if len(name) <= max_length:
+        return name
+    # Keep most important parts and add timestamp suffix
+    return name[:max_length]
+
+
+class HeatStressClassifier:
+    def __init__(self, local_mean_temp: Optional[float] = None):
+        self.adjustments = VULNERABILITY_ADJUSTMENTS
+        self.local_mean_temp = local_mean_temp
+
+    def calculate_adjustment(self, profile: Dict[str, Any]) -> Tuple[float, List[str]]:
+        """
+        Combine vulnerability adjustments using RMS per sign:
+          - positive (protective) adjustments combined via RMS
+          - negative (vulnerability) adjustments combined via RMS
+        Returns (net_adjustment, applied_factors_list)
+        net_adjustment is (pos_rms) - (neg_rms)  (so negative means net vulnerability)
+        """
+        pos_squares = 0.0
+        neg_squares = 0.0
+        pos_count = 0
+        neg_count = 0
+        applied_factors: List[str] = []
+
+        if not profile:
+            return 0.0, applied_factors
+
+        for category, value in profile.items():
+            if category == 'climate_region':
+                # preserve earlier robust handling for climate_region
+                if isinstance(value, dict):
+                    mean_temp = value.get('mean_temp')
+                    if mean_temp is not None:
+                        try:
+                            self.local_mean_temp = float(mean_temp)
+                            applied_factors.append(f"climate_region.mean_temp={self.local_mean_temp:.2f}°C")
+                        except (TypeError, ValueError):
+                            applied_factors.append("climate_region.mean_temp=INVALID")
+                continue
+
+            if category in self.adjustments:
+                val = value
+                if val in self.adjustments[category]:
+                    adj = float(self.adjustments[category][val])
+                    applied_factors.append(f"{category}:{val}={adj:+.2f}°C")
+                    if adj >= 0:
+                        pos_squares += adj * adj
+                        pos_count += 1
+                    else:
+                        neg_squares += (adj * adj)
+                        neg_count += 1
+                else:
+                    applied_factors.append(f"{category}:{val}=UNKNOWN")
+            else:
+                applied_factors.append(f"{category}:{value}=UNKNOWN")
+
+        pos_rms = math.sqrt(pos_squares) if pos_count > 0 else 0.0
+        neg_rms = math.sqrt(neg_squares) if neg_count > 0 else 0.0
+
+        # net adjustment: protective minus vulnerability (so negative net -> vulnerability)
+        net_adjustment = pos_rms - neg_rms
+
+        # record summary
+        applied_factors.append(f"pos_rms={pos_rms:+.2f}C neg_rms={neg_rms:+.2f}C net={net_adjustment:+.2f}C")
+        return net_adjustment, applied_factors
+
+    def get_adjusted_wbgt(self, wbgt_val: float, profile: Dict[str, Any]) -> Tuple[float, float, List[str]]:
+        adj, factors = self.calculate_adjustment(profile)
+        clim = 0.0
+        if self.local_mean_temp is not None:
+            clim = climate_offset(self.local_mean_temp)
+            factors.append(f"climate_offset={clim:+.2f}°C")
+        adjusted = wbgt_val - adj + clim
+        return adjusted, adj - clim, factors
+
+
+# ------------------------------
+# ACSM-based safe WBGT limits by MET ranges
+# ------------------------------
+ACSM_SAFE_LIMITS = [
+    ((0, 3), 30.0),
+    ((3, 5), 28.0),
+    ((5, 7), 26.0),
+    ((7, 9), 24.0),
+    ((9, 999), 22.0)
+]
+
+def get_acsm_limit_for_met(met_value: float) -> float:
+    for (low, high), limit in ACSM_SAFE_LIMITS:
+        if low <= met_value < high:
+            return limit
+    return ACSM_SAFE_LIMITS[-1][1]
+
+# ------------------------------
+# Default profiles (you can edit/add)
+# ------------------------------
+DEFAULT_PROFILES = {
+    "Healthy adult (30-49)": {'age_group':'30-49','fitness_level':'average','heat_acclimatization':'minimally_acclimatized','hydration_status':'normal'},
+    "Elderly (75+)": {'age_group':'75+','health_status':'hypertension','medication_use':'beta_blockers','hydration_status':'normal'},
+    "Elderly with dementia": {'age_group':'75+_dementia','health_status':'dementia_severe','medication_use':'dementia_medications','hydration_status':'impaired_thirst'},
+    "Child (6-12)": {'age_group':'6-12','fitness_level':'average','hydration_status':'normal'},
+    "Pregnant (3rd trimester)": {'pregnancy_status':'third_trimester','age_group':'30-49','hydration_status':'normal'},
+    "Outdoor worker (heavy)": {'age_group':'30-49','work_intensity':'heavy_work','hydration_status':'normal'}
+}
+
+# ------------------------------
+# Analysis function
+# ------------------------------
+def analyze_activity_from_excel(excel_file: str = "Hera.xlsx"):
+    if not os.path.exists(excel_file):
+        print(f"Error: {excel_file} not found in current folder.")
+        return
+
+    xls = pd.ExcelFile(excel_file)
+    sheets = xls.sheet_names
+    print("\nFound sheets in Hera.xlsx:")
+    for i, s in enumerate(sheets):
+        print(f"  {i+1}. {s}")
+    sel = input("Select sheet by number (default: last sheet): ").strip()
+    if sel == "":
+        sheet = sheets[-1]
+    else:
+        try:
+            idx = int(sel)-1
+            sheet = sheets[idx]
+        except Exception:
+            print("Invalid selection, using last sheet.")
+            sheet = sheets[-1]
+    print(f"Using sheet: {sheet}")
+
+    df = pd.read_excel(excel_file, sheet_name=sheet)
+    df.columns = [c.strip() for c in df.columns]
+
+    # WBGT column selection with priority order
+    col_with = None
+    print("\nAvailable WBGT columns in the sheet:")
+    wbgt_columns = {
+        'wbgt_latitude_adjusted': 'WBGT with latitude-based climate adaptation (recommended)',
+        'wbgt_with_uhi': 'WBGT with Urban Heat Island correction',
+        'wbgt_base': 'Base WBGT (no corrections)',
+        'wbgt_no_uhi': 'WBGT without UHI (legacy)',
+    }
+    available = [(k, v) for k, v in wbgt_columns.items() if k in df.columns]
+    
+    if not available:
+        print("ERROR: No WBGT columns found in sheet.")
+        return
+    
+    for i, (col, desc) in enumerate(available, 1):
+        print(f"  {i}. {col}: {desc}")
+    
+    choice = input(f"Select WBGT column (1-{len(available)}) [1]: ").strip() or "1"
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(available):
+            col_with = available[idx][0]
+        else:
+            col_with = available[0][0]
+    except ValueError:
+        col_with = available[0][0]
+    
+    print(f"Using WBGT column: {col_with}")
+
+    if col_with is None:
+        print("No WBGT column found in sheet. Aborting.")
+        return
+
+    datetime_col = None
+    for candidate in ['datetime_local', 'datetime_utc', 'dt', 'time', 'datetime']:
+        if candidate in df.columns:
+            datetime_col = candidate
+            break
+    if datetime_col is None:
+        datetime_col = df.columns[0]
+        print(f"No datetime column recognized. Using first column: {datetime_col}")
+
+    try:
+        df[datetime_col] = pd.to_datetime(df[datetime_col])
+    except Exception:
+        pass
+
+    met_input = input("Enter activity MET value (e.g. 3 for walking, 6 for work, 8 for running): ").strip()
+    try:
+        met_value = float(met_input)
+    except Exception:
+        print("Invalid MET input. Defaulting to 3.0")
+        met_value = 3.0
+
+    acsm_limit = get_acsm_limit_for_met(met_value)
+    print(f"ACSM reference WBGT limit for MET={met_value}: {acsm_limit} °C (healthy adult)")
+
+    print("\nAvailable default profiles:")
+    for i, name in enumerate(DEFAULT_PROFILES.keys()):
+        print(f"  {i+1}. {name}")
+    print("  a. All profiles")
+    pick = input("Select profiles by number separated by comma, or 'a' for all [a]: ").strip().lower() or 'a'
+    if pick == 'a':
+        selected_profiles = DEFAULT_PROFILES
+    else:
+        selected_profiles = {}
+        try:
+            nums = [int(x.strip()) for x in pick.split(',') if x.strip()!='']
+            keys = list(DEFAULT_PROFILES.keys())
+            for n in nums:
+                selected_profiles[keys[n-1]] = DEFAULT_PROFILES[keys[n-1]]
+        except Exception:
+            print("Invalid selection. Using all profiles.")
+            selected_profiles = DEFAULT_PROFILES
+
+    plot_dir = "hera_analysis_plots"
+    os.makedirs(plot_dir, exist_ok=True)
+
+    results = {}
+    classifier = HeatStressClassifier()
+    
+    # Generate timestamp once for all sheets
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+
+    # Create profile abbreviations mapping for shorter names
+    profile_abbrevs = {
+        "Healthy adult (30-49)": "Health_30-49",
+        "Elderly (75+)": "Elder_75",
+        "Elderly with dementia": "Elder_Dem",
+        "Child (6-12)": "Child_6-12",
+        "Pregnant (3rd trimester)": "Preg_3T",
+        "Outdoor worker (heavy)": "Work_Heavy"
+    }
+    
+    for prof_name, prof in selected_profiles.items():
+        wbgt_series = df[col_with].astype(float).copy()
+        adj_list = []
+        net_adj_list = []
+        factor_list = []
+        status_list = []
+        for wbgt_val in wbgt_series:
+            adjusted_wbgt, net_adj, factors = classifier.get_adjusted_wbgt(wbgt_val, prof)
+            adj_list.append(adjusted_wbgt)
+            net_adj_list.append(net_adj)
+            factor_list.append(';'.join(factors))
+            diff = adjusted_wbgt - acsm_limit
+            if diff < 0:
+                status = 'SAFE'
+            elif diff < 1.0:
+                status = 'CAUTION'
+            else:
+                status = 'UNSAFE'
+            status_list.append(status)
+
+        out_df = pd.DataFrame({
+            datetime_col: df[datetime_col],
+            'wbgt_selected': wbgt_series.values,
+            'adjusted_wbgt': adj_list,
+            'net_adjustment_C': net_adj_list,
+            'adjustment_factors': factor_list,
+            'status': status_list
+        })
+        out_df.set_index(datetime_col, inplace=True)
+        results[prof_name] = out_df
+
+        excel_out = excel_file
+        # Use predefined abbreviations for cleaner, shorter names
+        prof_abbrev = profile_abbrevs.get(prof_name, prof_name[:15].replace(' ', '_'))
+        sheet_name = f"A_{prof_abbrev}_{timestamp}"[:31]
+        
+        # Write to Excel with proper closing
+        writer = None
+        try:
+            if os.path.exists(excel_out):
+                writer = pd.ExcelWriter(excel_out, engine='openpyxl', mode='a', if_sheet_exists='replace')
+            else:
+                writer = pd.ExcelWriter(excel_out, engine='openpyxl', mode='w')
+            
+            out_df.reset_index().to_excel(writer, sheet_name=sheet_name, index=False)
+            writer.close()
+            
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except:
+                    pass
+
+        plt.figure(figsize=(12,5))
+        sns.lineplot(x=out_df.index, y='wbgt_selected', data=out_df, label='WBGT (selected)')
+        sns.lineplot(x=out_df.index, y='adjusted_wbgt', data=out_df, label='Adjusted WBGT')
+        plt.axhline(acsm_limit, color='k', linestyle='--', label=f'ACSM limit ({acsm_limit}°C)')
+        plt.fill_between(out_df.index, acsm_limit+1, out_df['adjusted_wbgt'].max()+2, color='red', alpha=0.1)
+        plt.title(f"{prof_name} — MET={met_value} — Safety: {excel_file} [{sheet}]")
+        plt.xlabel('Time')
+        plt.ylabel('WBGT (°C)')
+        plt.legend()
+        plt.tight_layout()
+        plot_file = os.path.join(plot_dir, f"analysis_{prof_name.replace(' ','_')}.png")
+        plt.savefig(plot_file)
+        plt.close()
+        print(f"Saved plot for {prof_name} -> {plot_file}  and sheet {sheet_name}")
+
+    plt.figure(figsize=(14,6))
+    for name, dfp in results.items():
+        sns.lineplot(x=dfp.index, y='adjusted_wbgt', data=dfp, label=name)
+    plt.axhline(acsm_limit, color='k', linestyle='--', label=f'ACSM limit ({acsm_limit}°C)')
+    plt.title(f"Comparative adjusted WBGT per profile — MET={met_value}")
+    plt.xlabel('Time')
+    plt.ylabel('Adjusted WBGT (°C)')
+    plt.legend(loc='upper left', bbox_to_anchor=(1,1))
+    plt.tight_layout()
+    comp_plot = os.path.join(plot_dir, f"comparison_MET_{int(met_value)}.png")
+    plt.savefig(comp_plot)
+    plt.close()
+    print(f"Saved comparative plot -> {comp_plot}")
+
+    summary_rows = []
+    for name, dfp in results.items():
+        unsafe_hours = (dfp['status']=='UNSAFE').sum()
+        caution_hours = (dfp['status']=='CAUTION').sum()
+        total_hours = len(dfp)
+        first_unsafe = dfp[dfp['status']=='UNSAFE'].index.min() if unsafe_hours>0 else None
+        summary_rows.append({'profile':name,'unsafe_hours':unsafe_hours,'caution_hours':caution_hours,'total_hours':total_hours,'first_unsafe':first_unsafe})
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_sheet = f"Sum_{timestamp}"[:31]
+    with pd.ExcelWriter(excel_file, engine='openpyxl', mode='a' if os.path.exists(excel_file) else 'w', if_sheet_exists='replace') as writer:
+        summary_df.to_excel(writer, sheet_name=summary_sheet, index=False)
+    print("Saved analysis summary to Excel.")
+
+    print("\nPlots and sheets saved. Analysis complete.")
+
+# ------------------------------
+# Console menu integration
+# ------------------------------
+def main_menu():
+    print("HERA Analysis Tool — menu")
+    print("1. Run analysis on existing Hera.xlsx (activity safety)")
+    print("2. Exit")
+    choice = input("Choose an option [1]: ").strip() or "1"
+    if choice == "1":
+        analyze_activity_from_excel("Hera.xlsx")
+    else:
+        print("Exit.")
+
+if __name__ == '__main__':
+    main_menu()
