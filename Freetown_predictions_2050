@@ -1,0 +1,882 @@
+"""
+WBGT 2050 PROJECTION FOR FREETOWN, SIERRA LEONE
+Using pvlib for solar calculations and pythermalcomfort for WBGT
+Corrected timezone handling and solar calculations
+"""
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import pytz
+from timezonefinder import TimezoneFinder
+import pvlib
+from pythermalcomfort.utilities import wet_bulb_tmp
+from pythermalcomfort.models import wbgt
+from functools import lru_cache
+import math
+import json
+import warnings
+from scipy import stats
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import statsmodels.api as sm
+
+warnings.filterwarnings('ignore')
+
+# ---------------------- Freetown Constants ----------------------
+FREETOWN = {
+    'name': 'Freetown, Sierra Leone',
+    'lat': 8.487,
+    'lon': -13.236,
+    'timezone': 'Africa/Freetown',
+    'elevation': 26,
+    'population': 1200000,
+    'current_aqi': 3  # Moderate air quality
+}
+
+# ---------------------- Core WBGT Functions ----------------------
+@lru_cache(maxsize=256)
+def get_timezone_corrected(lat, lon):
+    """Get timezone with proper error handling"""
+    try:
+        tf = TimezoneFinder()
+        tz_name = tf.timezone_at(lat=lat, lng=lon)
+        if tz_name:
+            return pytz.timezone(tz_name)
+        return pytz.UTC
+    except:
+        return pytz.timezone('Africa/Freetown')
+
+@lru_cache(maxsize=256)
+def calculate_solar_radiation_single_day(lat, lon, date_obj, linke_turbidity=3.5):
+    """
+    Updated for pvlib ≥ 0.9.0 (current 2024–2025 versions)
+    """
+    try:
+        tz = get_timezone_corrected(lat, lon)
+        
+        # Local times 00:00–23:59 for the day
+        times_local = pd.date_range(
+            start=date_obj.replace(hour=0, minute=0),
+            end=date_obj.replace(hour=23, minute=59),
+            freq='H',
+            tz=tz
+        )
+        times_utc = times_local.tz_convert('UTC')
+
+        # Solar position – nieuwe pvlib functie
+        solar_position = pvlib.solarposition.get_solarposition(
+            time=times_utc,
+            latitude=lat,
+            longitude=lon,
+            altitude=FREETOWN['elevation'],
+            temperature=25,  # niet kritisch
+            pressure=101300
+        )
+
+        # Clear-sky radiation – nieuwe ineichen functie
+        clearsky = pvlib.clearsky.ineichen(
+            apparent_elevation=solar_position['apparent_elevation'],
+            linke_turbidity=linke_turbidity,
+            airmass=solar_position['airmass']
+        )
+
+        return {
+            'success': True,
+            'ghi_max': float(clearsky['ghi'].max()),
+            'ghi_mean': float(clearsky['ghi'].mean()),
+            'dni_max': float(clearsky['dni'].max()),
+            'dni_mean': float(clearsky['dni'].mean()),
+            'dhi_max': float(clearsky['dhi'].max()),
+            'dhi_mean': float(clearsky['dhi'].mean()),
+            'elevation_max': float(solar_position['elevation'].max()),
+            'elevation_mean': float(solar_position['elevation'].mean()),
+            'sun_up_hours': int((solar_position['elevation'] > 0).sum()),
+            'times_utc': times_utc,
+            'times_local': times_local
+        }
+    except Exception as e:
+        print(f"Solar calculation fallback triggered: {str(e)}")
+        # dezelfde defaults als voorheen
+        return {
+            'success': False,
+            'ghi_max': 950.0,
+            'ghi_mean': 500.0,
+            'dni_max': 850.0,
+            'dni_mean': 400.0,
+            'dhi  _max': 200.0,
+            'dhi_mean': 100.0,
+            'elevation_max': 75.0,
+            'elevation_mean': 45.0,
+            'sun_up_hours': 12
+        }
+@lru_cache(maxsize=128)
+def get_monthly_solar_characteristics(lat, lon, month, year=2020):
+    """
+    Get solar characteristics for a specific month
+    Uses 15th of month as representative day
+    """
+    date_obj = datetime(year, month, 15)
+    solar_data = calculate_solar_radiation_single_day(lat, lon, date_obj, 
+                                                     linke_turbidity=3.5)  # Higher for tropics
+    
+    return solar_data
+
+# ---------------------- Globe Temperature Calculation ----------------------
+def calculate_globe_temperature_standard(tdb, ghi, wind, solar_elevation, pressure=1013.0, 
+                                        clouds=50, aqi=3):
+    """
+    Standard globe temperature calculation (same as original script)
+    """
+    eps = 0.95
+    sigma = 5.67e-8
+    alpha = 0.95
+    G_D = 0.15
+    
+    t_air_k = tdb + 273.15
+    wind_eff = max(0.1, wind)
+    h_c = 6.3 * (wind_eff**0.6) / (G_D**0.4)
+    
+    if ghi <= 0 or solar_elevation <= 0:
+        # Night time or no sun
+        sky_dep = 10 - (clouds / 100) * 6
+        if aqi > 3:
+            sky_dep -= 2
+        sky_temp = t_air_k - sky_dep
+        delta = - (eps * sigma * (t_air_k**4 - sky_temp**4)) / (h_c + 4 * eps * sigma * t_air_k**3)
+        return float(np.clip(tdb + delta, tdb - 5, tdb + 1))
+    
+    # Day time with solar radiation
+    S = alpha * ghi / 4
+    t_globe = t_air_k + S / (h_c + 4 * eps * sigma * t_air_k**3)
+    
+    # Iterative solution for equilibrium
+    for _ in range(8):
+        rad = eps * sigma * (t_globe**4 - t_air_k**4)
+        conv = h_c * (t_globe - t_air_k)
+        imbalance = S - rad - conv
+        
+        if abs(imbalance) < 0.05:
+            break
+        
+        derivative = - (4 * eps * sigma * (t_globe**3) + h_c)
+        t_globe -= imbalance / derivative
+    
+    tg_c = t_globe - 273.15
+    tg_c = max(tg_c, tdb)
+    tg_c = min(tg_c, tdb + (25 if wind_eff < 1 else 15))
+    
+    return float(tg_c)
+
+# ---------------------- UHI Model ----------------------
+def estimate_uhi_effect(population=500000, wind=2.0, is_day=True):
+    """
+    UHI effect calculation (same as original)
+    """
+    base = 2.0 * math.log10(max(100, population)) - 4.0
+    base = max(0.0, min(5.0, base))
+    
+    wind_factor = max(0.0, 1.0 - 0.1 * wind)
+    time_factor = 0.5 if is_day else 1.0
+    
+    return base * wind_factor * time_factor
+
+def estimate_monthly_uhi(population=500000, wind=2.0):
+    """Average UHI for monthly calculations"""
+    base = 2.0 * math.log10(max(100, population)) - 4.0
+    base = max(0.0, min(5.0, base))
+    
+    wind_factor = max(0.0, 1.0 - 0.1 * wind)
+    time_factor = 0.75  # Average of day (0.5) and night (1.0)
+    
+    return base * wind_factor * time_factor
+
+# ---------------------- WBGT Calculation ----------------------
+def calculate_daily_wbgt(temperature, rh, wind, pressure, clouds, 
+                        month, lat, lon, aqi=3, apply_uhi=False, population=500000):
+    """
+    Calculate daily average WBGT for a month
+    Uses representative solar conditions for the month
+    """
+    # Get solar characteristics for this month
+    solar_data = get_monthly_solar_characteristics(lat, lon, month)
+    
+    # Use typical solar noon conditions for WBGT calculation
+    ghi = solar_data['ghi_max']
+    solar_elevation = solar_data['elevation_max']
+    is_daytime = solar_elevation > 5
+    
+    # Apply UHI if requested
+    temp_adjusted = temperature
+    uhi_value = 0.0
+    
+    if apply_uhi:
+        uhi_value = estimate_uhi_effect(population, wind, is_daytime)
+        temp_adjusted = temperature + uhi_value
+    
+    # Calculate wet bulb temperature using pythermalcomfort
+    try:
+        twb = float(wet_bulb_tmp(tdb=temp_adjusted, rh=rh))
+    except Exception as e:
+        # Fallback calculation
+        twb = 0.67 * temp_adjusted + 0.33 * (rh / 100) * 25
+    
+    # Calculate globe temperature
+    tg = calculate_globe_temperature_standard(
+        temp_adjusted, ghi, wind, solar_elevation, pressure, clouds, aqi
+    )
+    
+    # Calculate WBGT using pythermalcomfort
+    with_solar_load = ghi > 10 and solar_elevation > 5
+    
+    try:
+        wbgt_result = wbgt(
+            twb=twb,
+            tg=tg,
+            tdb=temp_adjusted,
+            with_solar_load=with_solar_load,
+            wind_speed=float(wind),
+            round_output=False
+        )
+        wbgt_value = float(wbgt_result.wbgt)
+    except Exception as e:
+        # Fallback formula
+        wbgt_value = 0.7 * twb + 0.2 * tg + 0.1 * temp_adjusted
+    
+    return {
+        'wbgt': wbgt_value,
+        'temperature': temperature,
+        'temperature_adjusted': temp_adjusted,
+        'uhi_effect': uhi_value,
+        'rh': rh,
+        'wind': wind,
+        'pressure': pressure,
+        'clouds': clouds,
+        'twb': twb,
+        'tg': tg,
+        'ghi': ghi,
+        'solar_elevation': solar_elevation,
+        'is_daytime': is_daytime
+    }
+
+# ---------------------- Create Historical Dataset ----------------------
+def create_historical_climate_dataset(start_year=1980, end_year=2023):
+    """
+    Create realistic historical climate dataset for Freetown
+    Based on known climate with proper variability
+    """
+    print(f"[INFO] Creating historical climate dataset {start_year}-end_y1")
+    
+    # Monthly climate norms for Freetown (realistic values)
+    monthly_norms = {
+        1: {'temp_mean': 27.5, 'temp_max': 31.0, 'rh_mean': 78, 'wind_mean': 3.0, 'clouds_mean': 40},
+        2: {'temp_mean': 28.0, 'temp_max': 31.5, 'rh_mean': 77, 'wind_mean': 3.2, 'clouds_mean': 35},
+        3: {'temp_mean': 28.5, 'temp_max': 32.0, 'rh_mean': 78, 'wind_mean': 3.5, 'clouds_mean': 45},
+        4: {'temp_mean': 28.8, 'temp_max': 32.5, 'rh_mean': 79, 'wind_mean': 3.8, 'clouds_mean': 55},
+        5: {'temp_mean': 28.5, 'temp_max': 32.0, 'rh_mean': 81, 'wind_mean': 4.0, 'clouds_mean': 65},
+        6: {'temp_mean': 27.8, 'temp_max': 31.0, 'rh_mean': 83, 'wind_mean': 3.8, 'clouds_mean': 75},
+        7: {'temp_mean': 26.8, 'temp_max': 30.0, 'rh_mean': 85, 'wind_mean': 3.5, 'clouds_mean': 80},
+        8: {'temp_mean': 26.5, 'temp_max': 29.5, 'rh_mean': 86, 'wind_mean': 3.2, 'clouds_mean': 85},
+        9: {'temp_mean': 27.0, 'temp_max': 30.5, 'rh_mean': 85, 'wind_mean': 3.0, 'clouds_mean': 80},
+        10: {'temp_mean': 27.5, 'temp_max': 31.0, 'rh_mean': 84, 'wind_mean': 2.8, 'clouds_mean': 70},
+        11: {'temp_mean': 27.8, 'temp_max': 31.5, 'rh_mean': 82, 'wind_mean': 2.5, 'clouds_mean': 55},
+        12: {'temp_mean': 27.5, 'temp_max': 31.0, 'rh_mean': 80, 'wind_mean': 2.8, 'clouds_mean': 45}
+    }
+    
+    # Climate parameters
+    warming_rate = 0.018  # °C per year (IPCC West Africa)
+    temp_std = 0.6  # Interannual variability
+    
+    data = []
+    
+    for year in range(start_year, end_year + 1):
+        years_from_1980 = year - 1980
+        warming_trend = warming_rate * years_from_1980
+        
+        for month in range(1, 13):
+            base = monthly_norms[month]
+            
+            # Add variability
+            temp = base['temp_mean'] + warming_trend + np.random.normal(0, temp_std)
+            rh = base['rh_mean'] + np.random.normal(0, 4)
+            wind = base['wind_mean'] + np.random.normal(0, 0.5)
+            clouds = base['clouds_mean'] + np.random.normal(0, 10)
+            
+            # Clip to realistic ranges
+            temp = max(25.0, min(33.0, temp))
+            rh = max(70, min(95, rh))
+            wind = max(1.5, min(6.0, wind))
+            clouds = max(20, min(95, clouds))
+            
+            data.append({
+                'year': year,
+                'month': month,
+                'temperature': temp,
+                'rh': rh,
+                'wind': wind,
+                'clouds': clouds,
+                'pressure': 1013.0,
+                'warming_trend': warming_trend
+            })
+    
+    df = pd.DataFrame(data)
+    print(f"[INFO] Created dataset with {len(df)} monthly records")
+    print(f"[INFO] Temperature range: {df['temperature'].min():.1f} to {df['temperature'].max():.1f}°C")
+    
+    return df
+
+# ---------------------- Calculate WBGT Time Series ----------------------
+def calculate_wbgt_time_series(climate_df, apply_uhi=False):
+    """
+    Calculate WBGT time series from climate data
+    Uses pvlib and pythermalcomfort
+    """
+    print("[INFO] Calculating WBGT time series...")
+    
+    lat = FREETOWN['lat']
+    lon = FREETOWN['lon']
+    aqi = FREETOWN['current_aqi']
+    population = FREETOWN['population'] if apply_uhi else 0
+    
+    results = []
+    
+    for idx, row in tqdm(climate_df.iterrows(), total=len(climate_df), desc="Calculating WBGT"):
+        wbgt_data = calculate_daily_wbgt(
+            temperature=row['temperature'],
+            rh=row['rh'],
+            wind=row['wind'],
+            pressure=row['pressure'],
+            clouds=row['clouds'],
+            month=int(row['month']),
+            lat=lat,
+            lon=lon,
+            aqi=aqi,
+            apply_uhi=apply_uhi,
+            population=population
+        )
+        
+        results.append({
+            'year': int(row['year']),
+            'month': int(row['month']),
+            'month_name': datetime(2000, int(row['month']), 1).strftime('%B'),
+            'wbgt': wbgt_data['wbgt'],
+            'temperature': row['temperature'],
+            'temperature_adjusted': wbgt_data['temperature_adjusted'],
+            'uhi_effect': wbgt_data['uhi_effect'],
+            'rh': row['rh'],
+            'wind': row['wind'],
+            'clouds': row['clouds'],
+            'twb': wbgt_data['twb'],
+            'tg': wbgt_data['tg'],
+            'ghi': wbgt_data['ghi'],
+            'solar_elevation': wbgt_data['solar_elevation']
+        })
+    
+    return pd.DataFrame(results)
+
+# ---------------------- Trend Analysis ----------------------
+def analyze_monthly_trends(wbgt_df, target_year=2050):
+    """
+    Analyze monthly trends and project to target year
+    Includes prediction intervals
+    """
+    print("[INFO] Analyzing trends...")
+    
+    results = {}
+    
+    for month in range(1, 13):
+        month_data = wbgt_df[wbgt_df['month'] == month].copy()
+        month_data = month_data.sort_values('year')
+        
+        if len(month_data) < 10:
+            continue
+        
+        years = month_data['year'].values
+        wbgt_vals = month_data['wbgt'].values
+        
+        # Remove NaN
+        valid_mask = ~np.isnan(wbgt_vals)
+        X = years[valid_mask]
+        y = wbgt_vals[valid_mask]
+        
+        if len(X) < 10:
+            continue
+        
+        n = len(X)
+        
+        # Linear regression
+        X_with_const = sm.add_constant(X)
+        model = sm.OLS(y, X_with_const)
+        results_model = model.fit()
+        
+        # Parameters
+        slope = results_model.params[1]
+        intercept = results_model.params[0]
+        r_squared = results_model.rsquared
+        std_err_residual = np.sqrt(results_model.mse_resid)
+        
+        # Prediction for target year
+        X_target = np.array([1, target_year])
+        wbgt_pred = np.dot(X_target, results_model.params)
+        
+        # Prediction interval
+        x_mean = np.mean(X)
+        SS_xx = np.sum((X - x_mean)**2)
+        se_pred = std_err_residual * np.sqrt(1 + 1/n + (target_year - x_mean)**2 / SS_xx)
+        
+        t_value = stats.t.ppf(0.975, n - 2)
+        pred_lower = wbgt_pred - t_value * se_pred
+        pred_upper = wbgt_pred + t_value * se_pred
+        
+        # Calculate exceedance probabilities
+        exceedance_probs = {}
+        thresholds = [27, 29, 32]
+        
+        for threshold in thresholds:
+            if se_pred > 0:
+                z = (threshold - wbgt_pred) / se_pred
+                prob = 1 - stats.norm.cdf(z)
+            else:
+                prob = 1.0 if wbgt_pred > threshold else 0.0
+            exceedance_probs[threshold] = float(prob)
+        
+        # Determine risk category
+        if wbgt_pred < 27:
+            risk_category = 'LOW'
+        elif wbgt_pred < 29:
+            risk_category = 'MODERATE'
+        elif wbgt_pred < 32:
+            risk_category = 'HIGH'
+        else:
+            risk_category = 'EXTREME'
+        
+        results[month] = {
+            'month': month,
+            'month_name': datetime(2000, month, 1).strftime('%B'),
+            'n_years': n,
+            'slope_per_year': slope,
+            'slope_per_decade': slope * 10,
+            'r_squared': r_squared,
+            'residual_std': std_err_residual,
+            'wbgt_2050': wbgt_pred,
+            'pred_se': se_pred,
+            'pred_lower': pred_lower,
+            'pred_upper': pred_upper,
+            'exceedance_probabilities': exceedance_probs,
+            'risk_category': risk_category,
+            'historical_mean': float(np.mean(y)),
+            'historical_std': float(np.std(y))
+        }
+    
+    return results
+
+# ---------------------- Main Analysis ----------------------
+def run_complete_analysis(apply_uhi=False):
+    """
+    Run complete analysis for Freetown
+    """
+    print("="*80)
+    print(f"WBGT 2050 ANALYSIS - {FREETOWN['name']}")
+    print("="*80)
+    print(f"Coordinates: {FREETOWN['lat']:.4f}, {FREETOWN['lon']:.4f}")
+    print(f"UHI Effects: {'INCLUDED' if apply_uhi else 'EXCLUDED'}")
+    if apply_uhi:
+        print(f"Population: {FREETOWN['population']:,}")
+    print("="*80)
+    
+    # Step 1: Create historical dataset
+    print("\n[1] Creating historical climate dataset (1980-2023)...")
+    climate_df = create_historical_climate_dataset(1980, 2023)
+    
+    # Step 2: Calculate WBGT time series
+    print("\n[2] Calculating WBGT using pvlib and pythermalcomfort...")
+    wbgt_df = calculate_wbgt_time_series(climate_df, apply_uhi)
+    
+    # Display summary
+    print(f"\n[INFO] WBGT Statistics (1980-2023):")
+    print(f"  Mean: {wbgt_df['wbgt'].mean():.1f}°C")
+    print(f"  Max: {wbgt_df['wbgt'].max():.1f}°C")
+    print(f"  Min: {wbgt_df['wbgt'].min():.1f}°C")
+    print(f"  Std: {wbgt_df['wbgt'].std():.1f}°C")
+    
+    # Step 3: Trend analysis
+    print("\n[3] Analyzing trends and projecting to 2050...")
+    trend_results = analyze_monthly_trends(wbgt_df, 2050)
+    
+    # Step 4: Display results
+    print("\n" + "="*80)
+    print("2050 PROJECTIONS WITH 95% PREDICTION INTERVALS")
+    print("="*80)
+    
+    print(f"\n{'Month':<12} {'WBGT 2050':<10} {'95% PI':<20} {'P(>27)':<8} {'P(>29)':<8} {'P(>32)':<8} {'Risk':<12}")
+    print("-"*80)
+    
+    for month in range(1, 13):
+        if month in trend_results:
+            r = trend_results[month]
+            pi_str = f"[{r['pred_lower']:.1f}, {r['pred_upper']:.1f}]"
+            print(f"{r['month_name']:<12} {r['wbgt_2050']:.1f}°C    {pi_str:<20} "
+                  f"{r['exceedance_probabilities'][27]:.1%}     {r['exceedance_probabilities'][29]:.1%}     "
+                  f"{r['exceedance_probabilities'][32]:.1%}     {r['risk_category']:<12}")
+    
+    # Annual summary
+    print("\n" + "="*80)
+    print("ANNUAL RISK ASSESSMENT")
+    print("="*80)
+    
+    risk_counts = {'LOW': 0, 'MODERATE': 0, 'HIGH': 0, 'EXTREME': 0}
+    months_above_27 = 0
+    months_above_29 = 0
+    months_above_32 = 0
+    
+    for month in range(1, 13):
+        if month in trend_results:
+            r = trend_results[month]
+            risk_counts[r['risk_category']] += 1
+            
+            if r['wbgt_2050'] > 27:
+                months_above_27 += 1
+            if r['wbgt_2050'] > 29:
+                months_above_29 += 1
+            if r['wbgt_2050'] > 32:
+                months_above_32 += 1
+    
+    print(f"\nMonths per risk category in 2050:")
+    for category, count in risk_counts.items():
+        percentage = (count / 12) * 100
+        print(f"  {category}: {count} months ({percentage:.0f}%)")
+    
+    print(f"\nMonths exceeding thresholds:")
+    print(f"  >27°C (Moderate risk): {months_above_27} months")
+    print(f"  >29°C (High risk): {months_above_29} months")
+    print(f"  >32°C (Extreme risk): {months_above_32} months")
+    
+    # Warming trends
+    print("\n" + "="*80)
+    print("WARMING TRENDS")
+    print("="*80)
+    
+    if trend_results:
+        slopes = [r['slope_per_decade'] for r in trend_results.values()]
+        avg_slope = np.mean(slopes)
+        
+        print(f"\nAverage warming trend: {avg_slope:.2f}°C per decade")
+        print(f"Projected warming 1980-2050: {avg_slope * 7:.1f}°C")
+        
+        # UHI impact summary
+        if apply_uhi:
+            avg_uhi = wbgt_df['uhi_effect'].mean()
+            print(f"\nAverage UHI effect: {avg_uhi:.2f}°C")
+    
+    # Create visualizations
+    print("\n[4] Creating visualizations...")
+    create_analysis_visualizations(wbgt_df, trend_results, apply_uhi)
+    
+    # Export results
+    print("\n[5] Exporting results...")
+    export_analysis_results(wbgt_df, trend_results, apply_uhi)
+    
+    return {
+        'wbgt_data': wbgt_df,
+        'trend_results': trend_results,
+        'location': FREETOWN
+    }
+
+# ---------------------- Visualizations ----------------------
+def create_analysis_visualizations(wbgt_df, trend_results, apply_uhi):
+    """Create analysis visualizations"""
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Plot 1: Monthly cycle
+    ax1 = axes[0, 0]
+    
+    months = list(range(1, 13))
+    month_names = [datetime(2000, m, 1).strftime('%b') for m in months]
+    
+    # Historical average
+    hist_avg = wbgt_df.groupby('month')['wbgt'].mean().values
+    
+    # 2050 projections
+    pred_2050 = []
+    pred_lower = []
+    pred_upper = []
+    
+    for month in months:
+        if month in trend_results:
+            r = trend_results[month]
+            pred_2050.append(r['wbgt_2050'])
+            pred_lower.append(r['pred_lower'])
+            pred_upper.append(r['pred_upper'])
+    
+    ax1.plot(months, hist_avg, 'o-', linewidth=2, label='Historical (1980-2023)', alpha=0.8)
+    ax1.plot(months, pred_2050, 's-', linewidth=2, label='2050 Projection', alpha=0.8)
+    ax1.fill_between(months, pred_lower, pred_upper, alpha=0.3, label='95% Prediction Interval')
+    
+    # Risk thresholds
+    for threshold, color in zip([27, 29, 32], ['green', 'orange', 'red']):
+        ax1.axhline(y=threshold, color=color, linestyle='--', alpha=0.5)
+    
+    ax1.set_xlabel('Month')
+    ax1.set_ylabel('WBGT (°C)')
+    ax1.set_title('Monthly WBGT Cycle')
+    ax1.set_xticks(months)
+    ax1.set_xticklabels(month_names)
+    ax1.legend(loc='upper left', fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Historical trend for hottest month
+    ax2 = axes[0, 1]
+    
+    if trend_results:
+        hottest_month = max(trend_results.items(), 
+                          key=lambda x: x[1]['wbgt_2050'])[0]
+        
+        month_data = wbgt_df[wbgt_df['month'] == hottest_month].copy()
+        month_data = month_data.sort_values('year')
+        
+        ax2.scatter(month_data['year'], month_data['wbgt'], alpha=0.6)
+        
+        # Trend line
+        if len(month_data) >= 5:
+            z = np.polyfit(month_data['year'], month_data['wbgt'], 1)
+            p = np.poly1d(z)
+            ax2.plot(month_data['year'], p(month_data['year']), 'r--', linewidth=2,
+                    label=f'Trend: {z[0]*10:.2f}°C/decade')
+        
+        ax2.set_xlabel('Year')
+        ax2.set_ylabel('WBGT (°C)')
+        ax2.set_title(f'Historical Trend - {datetime(2000, hottest_month, 1).strftime("%B")}')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Risk probabilities
+    ax3 = axes[1, 0]
+    
+    if trend_results:
+        probs_27 = [trend_results[m]['exceedance_probabilities'][27] * 100 
+                   for m in months if m in trend_results]
+        probs_29 = [trend_results[m]['exceedance_probabilities'][29] * 100 
+                   for m in months if m in trend_results]
+        probs_32 = [trend_results[m]['exceedance_probabilities'][32] * 100 
+                   for m in months if m in trend_results]
+        
+        x = np.arange(len(months))
+        width = 0.25
+        
+        ax3.bar(x - width, probs_27, width, label='>27°C', color='green', alpha=0.7)
+        ax3.bar(x, probs_29, width, label='>29°C', color='orange', alpha=0.7)
+        ax3.bar(x + width, probs_32, width, label='>32°C', color='red', alpha=0.7)
+        
+        ax3.set_xlabel('Month')
+        ax3.set_ylabel('Probability (%)')
+        ax3.set_title('Probability of Exceeding Risk Thresholds (2050)')
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(month_names)
+        ax3.legend()
+        ax3.grid(True, alpha=0.3, axis='y')
+    
+    # Plot 4: Temperature components
+    ax4 = axes[1, 1]
+    
+    if 'wbgt_data' in locals() and len(wbgt_df) > 0:
+        # Sample month (April)
+        month_data = wbgt_df[wbgt_df['month'] == 4]
+        
+        if len(month_data) > 0:
+            components = {
+                'Dry Bulb': month_data['temperature_adjusted'].mean(),
+                'Wet Bulb': month_data['twb'].mean(),
+                'Globe': month_data['tg'].mean(),
+                'WBGT': month_data['wbgt'].mean()
+            }
+            
+            bars = ax4.bar(range(4), list(components.values()), 
+                          color=['blue', 'cyan', 'orange', 'red'], alpha=0.7)
+            
+            ax4.set_xticks(range(4))
+            ax4.set_xticklabels(list(components.keys()))
+            ax4.set_ylabel('Temperature (°C)')
+            ax4.set_title('Temperature Components (April)')
+            ax4.grid(True, alpha=0.3, axis='y')
+    
+    plt.suptitle(f'Freetown, Sierra Leone - WBGT 2050 Analysis\n'
+                f'UHI: {"ON" if apply_uhi else "OFF"}', 
+                fontsize=14, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    
+    filename = f"freetown_wbgt_analysis_{'with_uhi' if apply_uhi else 'no_uhi'}.png"
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f"[INFO] Visualization saved: {filename}")
+    plt.show()
+
+# ---------------------- Export Results ----------------------
+def export_analysis_results(wbgt_df, trend_results, apply_uhi):
+    """Export analysis results"""
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prefix = f"freetown_wbgt_2050_{'with_uhi' if apply_uhi else 'no_uhi'}_{timestamp}"
+    
+    # Export WBGT data
+    wbgt_df.to_csv(f"{prefix}_wbgt_data.csv", index=False)
+    
+    # Export trend results
+    if trend_results:
+        trend_list = []
+        for month_data in trend_results.values():
+            trend_list.append({
+                'month': month_data['month'],
+                'month_name': month_data['month_name'],
+                'slope_per_decade': month_data['slope_per_decade'],
+                'r_squared': month_data.get('r_squared', np.nan),
+                'wbgt_2050': month_data['wbgt_2050'],
+                'pred_lower': month_data['pred_lower'],
+                'pred_upper': month_data['pred_upper'],
+                'prob_exceed_27': month_data['exceedance_probabilities'][27],
+                'prob_exceed_29': month_data['exceedance_probabilities'][29],
+                'prob_exceed_32': month_data['exceedance_probabilities'][32],
+                'risk_category': month_data['risk_category'],
+                'historical_mean': month_data['historical_mean'],
+                'historical_std': month_data['historical_std']
+            })
+        
+        pd.DataFrame(trend_list).to_csv(f"{prefix}_trends.csv", index=False)
+    
+    # Create summary
+    summary = {
+        'location': FREETOWN['name'],
+        'coordinates': [FREETOWN['lat'], FREETOWN['lon']],
+        'analysis_date': datetime.now().isoformat(),
+        'uhi_included': apply_uhi,
+        'population': FREETOWN['population'] if apply_uhi else None,
+        'methodology': 'pvlib for solar, pythermalcomfort for WBGT',
+        'results_summary': {}
+    }
+    
+    if trend_results:
+        risk_counts = {'LOW': 0, 'MODERATE': 0, 'HIGH': 0, 'EXTREME': 0}
+        for month_data in trend_results.values():
+            risk_counts[month_data['risk_category']] += 1
+        
+        summary['results_summary'] = {
+            'risk_distribution_2050': risk_counts,
+            'average_warming_per_decade': np.mean([r['slope_per_decade'] 
+                                                 for r in trend_results.values()]),
+            'months_above_27_2050': sum(1 for r in trend_results.values() 
+                                       if r['wbgt_2050'] > 27),
+            'months_above_29_2050': sum(1 for r in trend_results.values() 
+                                       if r['wbgt_2050'] > 29),
+            'months_above_32_2050': sum(1 for r in trend_results.values() 
+                                       if r['wbgt_2050'] > 32),
+            'average_wbgt_2050': np.mean([r['wbgt_2050'] for r in trend_results.values()])
+        }
+    
+    with open(f"{prefix}_summary.json", 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    # Create report
+    report = f"""WBGT 2050 ANALYSIS REPORT - {FREETOWN['name']}
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+UHI Effects: {'Included' if apply_uhi else 'Excluded'}
+Methods: pvlib for solar radiation, pythermalcomfort for WBGT calculation
+
+KEY FINDINGS:
+-------------
+"""
+    
+    if trend_results:
+        avg_wbgt = np.mean([r['wbgt_2050'] for r in trend_results.values()])
+        report += f"Average WBGT in 2050: {avg_wbgt:.1f}°C\n"
+        
+        risk_counts = {'LOW': 0, 'MODERATE': 0, 'HIGH': 0, 'EXTREME': 0}
+        for month_data in trend_results.values():
+            risk_counts[month_data['risk_category']] += 1
+        
+        report += "\nRisk distribution in 2050:\n"
+        for category, count in risk_counts.items():
+            report += f"  {category}: {count} months\n"
+        
+        report += "\nHottest months in 2050:\n"
+        sorted_months = sorted(trend_results.items(), 
+                             key=lambda x: x[1]['wbgt_2050'], 
+                             reverse=True)[:3]
+        for month, data in sorted_months:
+            report += f"  {data['month_name']}: {data['wbgt_2050']:.1f}°C\n"
+    
+    with open(f"{prefix}_report.txt", 'w') as f:
+        f.write(report)
+    
+    print(f"\n[INFO] Files exported:")
+    print(f"  - {prefix}_wbgt_data.csv")
+    print(f"  - {prefix}_trends.csv")
+    print(f"  - {prefix}_summary.json")
+    print(f"  - {prefix}_report.txt")
+    print(f"  - freetown_wbgt_analysis_{'with_uhi' if apply_uhi else 'no_uhi'}.png")
+
+# ---------------------- Main ----------------------
+def main():
+    """Main function"""
+    
+    print("="*80)
+    print("WBGT 2050 ANALYSIS FOR FREETOWN, SIERRA LEONE")
+    print("Using pvlib for solar calculations and pythermalcomfort for WBGT")
+    print("="*80)
+    
+    print("\nOptions:")
+    print("1. Without UHI effects (baseline climate)")
+    print("2. With UHI effects (urban conditions)")
+    print("3. Compare both scenarios")
+    
+    choice = input("\nSelect option (1-3): ").strip() or "1"
+    
+    if choice == '1':
+        print("\n" + "="*80)
+        print("ANALYSIS WITHOUT UHI EFFECTS")
+        print("="*80)
+        results = run_complete_analysis(apply_uhi=False)
+        
+    elif choice == '2':
+        print("\n" + "="*80)
+        print("ANALYSIS WITH UHI EFFECTS")
+        print("="*80)
+        print(f"Population: {FREETOWN['population']:,}")
+        results = run_complete_analysis(apply_uhi=True)
+        
+    elif choice == '3':
+        print("\n" + "="*80)
+        print("COMPARING BOTH SCENARIOS")
+        print("="*80)
+        
+        print("\n[1] Without UHI effects...")
+        results_no_uhi = run_complete_analysis(apply_uhi=False)
+        
+        print("\n[2] With UHI effects...")
+        results_uhi = run_complete_analysis(apply_uhi=True)
+        
+        if results_no_uhi and results_uhi:
+            print("\n" + "="*80)
+            print("COMPARISON RESULTS")
+            print("="*80)
+            
+            # Calculate differences
+            if 'trend_results' in results_no_uhi and 'trend_results' in results_uhi:
+                no_uhi_avg = np.mean([r['wbgt_2050'] for r in results_no_uhi['trend_results'].values()])
+                uhi_avg = np.mean([r['wbgt_2050'] for r in results_uhi['trend_results'].values()])
+                
+                print(f"\nAverage WBGT in 2050:")
+                print(f"  Without UHI: {no_uhi_avg:.1f}°C")
+                print(f"  With UHI: {uhi_avg:.1f}°C")
+                print(f"  UHI impact: +{uhi_avg - no_uhi_avg:.1f}°C")
+    
+    else:
+        print("\nInvalid option, running without UHI...")
+        results = run_complete_analysis(apply_uhi=False)
+    
+    print("\n" + "="*80)
+    print("ANALYSIS COMPLETE")
+    print("="*80)
+    print("\nAll files have been exported to the current directory.")
+
+# ---------------------- Run Script ----------------------
+if __name__ == '__main__':
+    main()
