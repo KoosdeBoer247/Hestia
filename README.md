@@ -1,6 +1,6 @@
 <img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/d4cc9159-cf56-4de2-9203-f95b60f3968b" />
 ⚠️ **WORK IN PROGRESS** - I am looking for feedback and cooperation !
-> Feedback achter [Issues](https://github.com/KoosdeBoer247/Hestia/issues)
+ [Issues](https://github.com/KoosdeBoer247/Hestia/issues)
 
 # Hestia
 # Integrated Heat Stress Assessment Framework: A Multi-Scale Approach to WBGT Prediction and Thermoregulatory Simulation
