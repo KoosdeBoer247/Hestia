@@ -1,3 +1,4 @@
+<img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/d4cc9159-cf56-4de2-9203-f95b60f3968b" />
 # Hestia
 # Integrated Heat Stress Assessment Framework: A Multi-Scale Approach to WBGT Prediction and Thermoregulatory Simulation
 
